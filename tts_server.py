@@ -1,9 +1,9 @@
 """TTS MCP Server for Claude Code notifications.
 
-Provides speech synthesis via MLX-audio and Kokoro-82M on Apple Silicon.
+Provides speech synthesis via MLX-audio and Chatterbox Turbo on Apple Silicon.
 Exposes a ``notify`` tool for task completion alerts, a ``speak`` tool for
-general-purpose TTS with voice/speed control, and an ``interrupt`` tool to
-cut off playback and discard the backlog.
+longer narration, and an ``interrupt`` tool to cut off playback and discard the
+backlog. Runs either as a per-session stdio server or as one shared daemon.
 """
 
 import argparse
@@ -15,8 +15,7 @@ import itertools
 import json
 import logging
 import pathlib
-import signal
-import tempfile
+import threading
 import time
 import tomllib
 import urllib.parse
@@ -24,6 +23,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import mlx.core as mx
+import numpy as np
+import sounddevice
 import soundfile as sf
 from fastmcp import Context, FastMCP
 from mlx.nn.layers import Module
@@ -40,13 +41,29 @@ logger = logging.getLogger(__name__)
 # lower. Kokoro was 37 ms but capped us at a handful of distinguishable voices;
 # Turbo clones from a reference clip instead, which is what lets each workspace
 # sound different.
+#
+# Turbo has no emotion control, whatever the API suggests. `exaggeration` is
+# accepted by generate() and prepare_conditionals() and silently does nothing:
+# T3Config.turbo() sets emotion_adv=False, so the emotion_adv_fc projection is
+# never even constructed. Confirmed by measurement — varying it 0.0 to 1.0
+# changes the audio less than two identical calls differ from each other.
+# Base Chatterbox does support it and ships the weight, but costs 660 ms
+# against Turbo's 190 ms. Not worth it: channels are distinguished by priority
+# and by how the message is worded, and workspaces by voice and spoken label.
 SAMPLE_RATE = 24000
-SPEED = 1.2
+SPEED = 1.1
 HUGGINGFACE_REPO = "mlx-community/Chatterbox-Turbo-TTS-8bit"
 
-# Chatterbox ignores a speed argument, so rate lives at playback via `afplay -r`.
-# That decouples it from synthesis: changing speed no longer re-runs the model.
+# One rate for everything. Per-channel speeds were a Kokoro-era idea that never
+# earned its keep: the whole 1.0-to-1.3 range saved under half a second on a
+# typical notification, and a channel's meaning is better carried by how the
+# message is worded than by how fast it is read. Rate is applied at playback,
+# so changing it does not re-run the model.
 MIN_SPEED, MAX_SPEED = 0.5, 2.0
+
+# Samples handed to the device per write. Small enough that interrupt() cuts in
+# within ~85 ms, large enough not to churn.
+WRITE_CHUNK = 2048
 
 # Chatterbox rejects shorter reference clips outright ("Audio prompt must be
 # longer than 5 seconds!"), so catch it up front with a legible message.
@@ -68,7 +85,7 @@ DEFAULT_PORT = 8765
 
 
 # ---------------------------------------------------------------------------
-# Channels — named voice/speed/priority profiles
+# Channels — priority classes for the shared playback queue
 # ---------------------------------------------------------------------------
 
 
@@ -79,10 +96,10 @@ class Channel:
 
 
 DEFAULT_CHANNELS: dict[str, Channel] = {
-    "notify": Channel(speed=1.2, priority=10),
-    "permission": Channel(speed=1.0, priority=1),
-    "question": Channel(speed=1.0, priority=2),
-    "narrate": Channel(speed=1.3, priority=15),
+    "notify": Channel(speed=SPEED, priority=10),
+    "permission": Channel(speed=SPEED, priority=1),
+    "question": Channel(speed=SPEED, priority=2),
+    "narrate": Channel(speed=SPEED, priority=15),
 }
 
 
@@ -306,15 +323,20 @@ class PlaybackQueue:
             maxsize=maxsize
         )
         self._worker: asyncio.Task[None] | None = None
-        self._current: asyncio.subprocess.Process | None = None
+        self._stream: sounddevice.OutputStream | None = None
+        self._cut = threading.Event()
 
     def start(self) -> None:
-        """Start the background drain task."""
+        """Open the audio device once and start the background drain task."""
+        self._stream = sounddevice.OutputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32"
+        )
+        self._stream.start()
         self._worker = asyncio.create_task(self._drain())
         logger.info("Playback worker started.")
 
     async def stop(self) -> None:
-        """Cancel the worker and clean up."""
+        """Cancel the worker and close the device."""
         if self._worker is not None:
             self._worker.cancel()
             try:
@@ -322,6 +344,10 @@ class PlaybackQueue:
             except asyncio.CancelledError:
                 pass
             self._worker = None
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
         logger.info("Playback worker stopped.")
 
     def enqueue(self, audio: mx.array, priority: int = 10, speed: float = 1.0) -> bool:
@@ -351,8 +377,7 @@ class PlaybackQueue:
                 break
             self._queue.task_done()
             dropped += 1
-        if self._current is not None and self._current.returncode is None:
-            self._current.terminate()
+        self._cut.set()
         return dropped
 
     async def _drain(self) -> None:
@@ -367,27 +392,25 @@ class PlaybackQueue:
                 self._queue.task_done()
 
     async def _play(self, audio: mx.array, speed: float = 1.0) -> None:
-        """Write audio to a temp WAV and play via afplay at the given rate."""
-        fd, name = tempfile.mkstemp(suffix=".wav", prefix="tts_")
-        path = pathlib.Path(name)
-        try:
-            await asyncio.to_thread(_write_wav, fd, audio)
-            proc = await asyncio.create_subprocess_exec(
-                "afplay",
-                "-r",
-                str(speed),
-                str(path),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            self._current = proc
-            _, stderr = await proc.communicate()
-            # -SIGTERM is how interrupt() stops playback; not a failure.
-            if proc.returncode not in (0, -signal.SIGTERM):
-                raise RuntimeError(f"afplay failed: {stderr.decode()}")
-        finally:
-            self._current = None
-            path.unlink(missing_ok=True)
+        """Push samples to the already-open device.
+
+        This used to shell out to `afplay`, which cost ~1.0 s of process and
+        CoreAudio startup per utterance — five times the synthesis time, paid on
+        every single notification. Holding one stream open removes it entirely.
+        """
+        if self._stream is None:
+            raise RuntimeError("Audio stream is not open")
+        data = _at_speed(np.asarray(audio, dtype=np.float32).reshape(-1), speed)
+        self._cut.clear()
+        await asyncio.to_thread(self._write, data)
+
+    def _write(self, data: np.ndarray) -> None:
+        """Blocking write in chunks, so interrupt() can cut in mid-utterance."""
+        for i in range(0, len(data), WRITE_CHUNK):
+            if self._cut.is_set():
+                logger.debug("Playback cut short after %d samples", i)
+                return
+            self._stream.write(data[i : i + WRITE_CHUNK])
 
 
 _playback: PlaybackQueue | None = None
@@ -559,10 +582,19 @@ def generate(text: str, ref_audio: str | None = None) -> mx.array:
     return audio
 
 
-def _write_wav(fd: int, audio: mx.array) -> None:
-    """Write audio as WAV to an open descriptor, closing it afterwards."""
-    with open(fd, "wb") as f:
-        sf.write(f, audio, SAMPLE_RATE, format="WAV")
+def _at_speed(audio: np.ndarray, speed: float) -> np.ndarray:
+    """Resample for playback rate.
+
+    A plain rate change, so it shifts pitch slightly — the same thing
+    `afplay -r` did. Imperceptible at the 1.1 we actually use; a phase vocoder
+    would be the fix if we ever wanted large, pitch-preserving changes.
+    """
+    if abs(speed - 1.0) < 1e-3:
+        return audio
+    n = max(1, int(len(audio) / speed))
+    return np.interp(
+        np.linspace(0, len(audio) - 1, n), np.arange(len(audio)), audio
+    ).astype(np.float32)
 
 
 def _require_playback() -> PlaybackQueue:
