@@ -1,17 +1,40 @@
 [project]
-name = "tts-mcp-server"
+name = "maggid"
 version = "0.1.0"
 description = "macOS TTS notification server for Claude Code"
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp>=2.0.0",
+    # Capped below 3.0. The 3.x line reorganized fastmcp.server.auth, so a
+    # resolver free to cross the major boundary picks up a fastmcp that no
+    # longer imports. Raise the cap deliberately, with the tests as evidence.
+    "fastmcp>=2.14.5,<3",
     "mlx-audio>=0.4.6",
     "sounddevice>=0.5.0",
     "numpy>=2.0",
     "soundfile>=0.12.1",
-    "en_core_web_sm@https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    # server.py imports RichHandler directly. It arrives transitively through
+    # fastmcp, so the import survives without this line — until fastmcp drops it.
+    # Uncapped: RichHandler is unchanged on 15.0.
+    "rich>=14.0",
 ]
 
 [project.scripts]
-tts-mcp-server = "tts_server:main"
-tts-mcp-init = "tts_server:init"
+maggid = "maggid:main"
+maggid-init = "maggid:init"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["maggid"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
