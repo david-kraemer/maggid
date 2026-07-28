@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent for the shared TTS daemon.
+
+  Install (substitutes the absolute path, which launchd requires):
+
+    sed "s|__VENV__|$PWD/.venv|g" launchd/com.tts-mcp-server.plist \
+      > ~/Library/LaunchAgents/com.tts-mcp-server.plist
+    launchctl load ~/Library/LaunchAgents/com.tts-mcp-server.plist
+
+  A LaunchAgent (not a LaunchDaemon) is required: LaunchDaemons run outside the
+  user's GUI session and cannot reach the audio device, so afplay would fail.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tts-mcp-server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__VENV__/bin/tts-mcp-server</string>
+        <string>--transport</string>
+        <string>http</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8765</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if the daemon dies. One process now serves every session, so a
+         crash silences the whole fleet until it comes back. Claude Code
+         reconnects on its next tool call; only the utterance in flight is lost. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't respawn faster than this if it crashes on startup. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/tts-mcp-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/tts-mcp-server.err</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

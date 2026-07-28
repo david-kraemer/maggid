@@ -12,17 +12,20 @@ import concurrent.futures
 import dataclasses
 import functools
 import itertools
+import json
 import logging
 import pathlib
 import signal
 import tempfile
+import time
 import tomllib
+import urllib.parse
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import mlx.core as mx
 import soundfile as sf
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from mlx.nn.layers import Module
 from mlx_audio.tts.utils import load_model as mlx_load_model
 from rich.logging import RichHandler
@@ -54,6 +57,14 @@ MIN_REF_SECONDS = 5.0
 MAX_BACKLOG = 32
 
 CHANNELS_CONFIG = pathlib.Path.home() / ".config" / "tts-mcp-server" / "channels.toml"
+
+# Shared-daemon defaults. One process serving every session means one model in
+# memory instead of one per session, one warmup instead of N, and — the point —
+# a single playback queue, so an urgent channel in one workspace preempts
+# narration in another. Loopback only: an open port here lets any local process
+# make the machine talk.
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +110,13 @@ def load_config(
         except ValueError as e:
             logger.warning("%s — falling back to built-in voice.", e)
             ref_audio = None
+
+    global _prefix_enabled, _voice_overrides
+    _prefix_enabled = bool(raw.get("prefix", True))
+    _voice_overrides = dict(raw.get("voices", {}))
+
     for name, overrides in raw.items():
-        if not isinstance(overrides, dict):
+        if name == "voices" or not isinstance(overrides, dict):
             continue
         base = DEFAULT_CHANNELS.get(name)
         channels[name] = Channel(
@@ -143,6 +159,127 @@ def _resolve(
 
 _ref_audio: str | None = None
 _channels: dict[str, Channel] = {}
+_warm_on_start: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Identity — which workspace is speaking
+# ---------------------------------------------------------------------------
+
+VOICES_DIR = pathlib.Path.home() / ".config" / "tts-mcp-server" / "voices" / "refs"
+ASSIGNMENTS = pathlib.Path.home() / ".config" / "tts-mcp-server" / "assignments.json"
+
+# Auditioned set: every voice rated 8+, then the exact maximin subset by
+# speaker-embedding cosine. Ordered best-rated first, which is also assignment
+# order, so the first workspace seen gets the best voice.
+#
+# Nine voices is the ceiling and it is a soft one — the most separated nine of
+# any selection still contain a pair at 0.86 cosine, because Chatterbox pulls
+# everything it clones toward its own character. Voice alone reliably carries
+# maybe four or five workspaces, which is why the spoken label does the real
+# work and the voice reinforces it.
+VOICE_POOL = (
+    "af_heart",
+    "af_jessica",
+    "af_sarah",
+    "am_liam",
+    "bf_isabella",
+    "am_fenrir",
+    "am_puck",
+    "bf_alice",
+    "bm_daniel",
+)
+
+
+class VoiceRegistry:
+    """Assigns a stable voice per workspace, surviving daemon restarts.
+
+    Keyed on the workspace root rather than the MCP session id: a session id
+    rotates whenever the client reconnects, which would reshuffle every voice
+    the first time the daemon bounced.
+    """
+
+    def __init__(self, path: pathlib.Path = ASSIGNMENTS) -> None:
+        self._path = path
+        self._map: dict[str, str] = {}
+        try:
+            self._map = json.loads(path.read_text())
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            logger.warning("Could not read %s — starting fresh.", path)
+
+    def voice(self, root: str) -> str:
+        """Preset assigned to this workspace, allocating one on first sight."""
+        if root not in self._map:
+            used = set(self._map.values())
+            free = [v for v in VOICE_POOL if v not in used]
+            # Past nine workspaces the pool wraps. Deterministic so the
+            # assignment is at least stable, but two roots now share a voice
+            # and only the spoken label tells them apart.
+            self._map[root] = (
+                free[0] if free else VOICE_POOL[len(self._map) % len(VOICE_POOL)]
+            )
+            logger.info("Assigned voice %s to %s", self._map[root], root)
+            self._save()
+        return self._map[root]
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(self._map, indent=2, sort_keys=True))
+        except OSError:
+            logger.warning("Could not persist assignments to %s", self._path)
+
+
+_registry = VoiceRegistry()
+_voice_overrides: dict[str, str] = {}
+_prefix_enabled: bool = True
+
+
+async def identity(ctx: Context) -> tuple[str | None, str]:
+    """Resolve the caller's workspace into a voice and a spoken label.
+
+    :returns: (ref_audio path or None, label — empty when unidentifiable)
+    """
+    root = await workspace_root(ctx)
+    if root is None:
+        return _ref_audio, ""
+    label = pathlib.PurePath(root).name or "workspace"
+    preset = _voice_overrides.get(label) or _registry.voice(root)
+    clip = VOICES_DIR / f"{preset}.wav"
+    if not clip.is_file():
+        logger.warning("Voice clip %s missing — using configured default.", clip)
+        return _ref_audio, label
+    return str(clip), label
+
+
+async def workspace_root(ctx: Context) -> str | None:
+    """Filesystem path the client advertises as its root, if it advertises one."""
+    try:
+        roots = await ctx.list_roots()
+    except Exception as e:  # noqa: BLE001 - identity is best-effort
+        # Clients need not support roots, and a transport hiccup here should
+        # cost the label, not the notification.
+        logger.debug("No workspace root available: %s", e)
+        return None
+    if not roots:
+        return None
+    uri = str(roots[0].uri)
+    if not uri.startswith("file://"):
+        return uri or None
+    return urllib.parse.unquote(urllib.parse.urlparse(uri).path) or None
+
+
+def announce(label: str, text: str) -> str:
+    """Prepend the workspace label so the listener knows who is talking.
+
+    A period rather than a dash: the engine reads it as a pause, where a dash
+    is either swallowed or spoken.
+    """
+    if not label or not _prefix_enabled:
+        return text
+    return f"{label}. {text}"
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +405,30 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[dict]:
     _ref_audio, _channels = load_config()
     _playback = PlaybackQueue()
     _playback.start()
+    # Warm the model off the critical path. Loading takes ~20 s, which a
+    # long-lived daemon should absorb at login rather than charging to whoever
+    # sends the first notification. The transport is already listening, so the
+    # handshake stays instant either way.
+    warm = asyncio.create_task(_warmup()) if _warm_on_start else None
     try:
         yield {}
     finally:
+        if warm is not None:
+            warm.cancel()
         await _playback.stop()
         _playback = None
+
+
+async def _warmup() -> None:
+    """Load the model in the synthesis thread, logging rather than raising."""
+    try:
+        t0 = time.monotonic()
+        await asyncio.get_running_loop().run_in_executor(_synthesis, load_model)
+        logger.info("Warmup finished in %.1fs.", time.monotonic() - t0)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Warmup failed; first call will pay the load cost")
 
 
 mcp = FastMCP("TTS Notification Server", lifespan=lifespan)
@@ -281,6 +437,7 @@ mcp = FastMCP("TTS Notification Server", lifespan=lifespan)
 @mcp.tool()
 async def notify(
     message: str,
+    ctx: Context,
     speed: float | None = None,
     channel: str | None = None,
 ) -> str:
@@ -293,15 +450,17 @@ async def notify(
     playback = _require_playback()
     speed_, priority = _resolve(_channels, channel, speed)
     _validate_speed(speed_)
-    audio = await synthesize(message, ref_audio=_ref_audio)
+    ref, label = await identity(ctx)
+    audio = await synthesize(announce(label, message), ref_audio=ref)
     if not playback.enqueue(audio, priority=priority, speed=speed_):
         return f"Dropped (backlog full): {message}"
-    return f"Notified: {message}"
+    return f"Notified{f' as {label}' if label else ''}: {message}"
 
 
 @mcp.tool()
 async def speak(
     text: str,
+    ctx: Context,
     ref_audio: str | None = None,
     speed: float | None = None,
     channel: str | None = None,
@@ -309,21 +468,24 @@ async def speak(
     """Generate and play speech, optionally cloning a reference voice.
 
     :param text: Text to speak.
-    :param ref_audio: Path to a WAV clip to clone (overrides instance default).
+    :param ref_audio: Path to a WAV clip to clone (overrides the workspace voice).
     :param speed: Playback speed multiplier, 0.5–2.0.
     :param channel: Named channel for speed/priority defaults.
     """
     playback = _require_playback()
-    ref = ref_audio if ref_audio is not None else _ref_audio
-    if ref is not None:
-        _validate_ref_audio(ref)
+    if ref_audio is not None:
+        _validate_ref_audio(ref_audio)
+        ref, label = ref_audio, ""
+    else:
+        ref, label = await identity(ctx)
     speed_, priority = _resolve(_channels, channel, speed)
     _validate_speed(speed_)
-    audio = await synthesize(text, ref_audio=ref)
+    audio = await synthesize(announce(label, text), ref_audio=ref)
     if not playback.enqueue(audio, priority=priority, speed=speed_):
         return f"Dropped (backlog full): {len(text)} chars"
     dur = len(audio) / SAMPLE_RATE / speed_
-    return f"Spoke {len(text)} chars in {dur:.1f}s (voice={ref or 'built-in'}, speed={speed_}x)"
+    who = label or pathlib.PurePath(ref).stem if ref else "built-in"
+    return f"Spoke {len(text)} chars in {dur:.1f}s (voice={who}, speed={speed_}x)"
 
 
 @mcp.tool()
@@ -430,11 +592,63 @@ def _validate_speed(speed: float) -> None:
         raise ValueError(f"Speed must be {MIN_SPEED}–{MAX_SPEED}, got {speed}")
 
 
-def main():
-    logger.info("Starting TTS MCP server ...")
-    # Start the MCP transport immediately so the handshake succeeds,
-    # then warm up the model lazily on first tool call.
-    mcp.run(transport="stdio")
+def main(argv: list[str] | None = None) -> None:
+    """Run the server. Argument parsing lives here so the console script sees it."""
+    global _warm_on_start
+    args = _parse_args(argv)
+
+    if args.command == "init":
+        logger.info("Preloading model for faster first response...")
+        init()
+        return
+
+    # Warm eagerly when we're the shared daemon, lazily when we're a per-session
+    # stdio child that may never be asked to speak at all.
+    _warm_on_start = args.warm if args.warm is not None else args.transport == "http"
+
+    if args.transport == "http":
+        logger.info("Starting shared TTS daemon on %s:%d ...", args.host, args.port)
+        mcp.run(transport="http", host=args.host, port=args.port)
+    else:
+        logger.info("Starting TTS MCP server (stdio) ...")
+        mcp.run(transport="stdio")
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="tts-mcp-server",
+        description="TTS MCP server for Claude Code — Chatterbox Turbo on Apple Silicon.",
+        epilog="Run without arguments for a per-session stdio server.",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["init"],
+        default=None,
+        help="'init' to pre-download the TTS model and write a default config.",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help="'http' runs one shared daemon for every session (default: stdio).",
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help="HTTP bind address.")
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help="HTTP port to listen on."
+    )
+    warm = parser.add_mutually_exclusive_group()
+    warm.add_argument(
+        "--warm",
+        dest="warm",
+        action="store_true",
+        default=None,
+        help="Load the model at startup instead of on first call.",
+    )
+    warm.add_argument(
+        "--no-warm", dest="warm", action="store_false", help="Always load lazily."
+    )
+    return parser.parse_args(argv)
 
 
 def write_default_config(path: pathlib.Path = CHANNELS_CONFIG) -> bool:
@@ -446,8 +660,19 @@ def write_default_config(path: pathlib.Path = CHANNELS_CONFIG) -> bool:
         logger.info("Config already exists at %s — skipping.", path)
         return False
     lines = [
-        "# Path to a WAV clip to clone. Omit to use Chatterbox's built-in voice.",
-        '# ref_audio = "/Users/you/.config/tts-mcp-server/voices/mine.wav"',
+        "# Speak the workspace name before each message, so you can tell which",
+        "# agent is talking. Voice alone does not reliably carry more than a few.",
+        "prefix = true",
+        "",
+        "# Fallback clip when the workspace can't be identified. Omit for the",
+        "# built-in voice.",
+        '# ref_audio = "/Users/you/.config/tts-mcp-server/voices/refs/af_heart.wav"',
+        "",
+        "# Pin a workspace to a voice. Keys are directory names; values are",
+        "# presets under voices/refs/. Unpinned workspaces are assigned",
+        "# automatically on first contact and remembered in assignments.json.",
+        "# [voices]",
+        '# spade = "af_heart"',
         "",
     ]
     for name, ch in DEFAULT_CHANNELS.items():
@@ -464,21 +689,4 @@ def init():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="TTS MCP server for Claude Code — Kokoro-82M on Apple Silicon.",
-        epilog="Run without arguments to start the MCP server.",
-    )
-    parser.add_argument(
-        "command",
-        nargs="?",
-        choices=["init"],
-        default=None,
-        help="'init' to pre-download the TTS model (~200 MB).",
-    )
-    args = parser.parse_args()
-
-    if args.command == "init":
-        logger.info("Preloading model for faster first response...")
-        init()
-    else:
-        main()
+    main()
