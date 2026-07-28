@@ -1,8 +1,9 @@
 """TTS MCP Server for Claude Code notifications.
 
 Provides speech synthesis via MLX-audio and Kokoro-82M on Apple Silicon.
-Exposes a ``notify`` tool for task completion alerts and a ``speak`` tool
-for general-purpose TTS with voice/speed control.
+Exposes a ``notify`` tool for task completion alerts, a ``speak`` tool for
+general-purpose TTS with voice/speed control, and an ``interrupt`` tool to
+cut off playback and discard the backlog.
 """
 
 import argparse
@@ -12,6 +13,7 @@ import functools
 import itertools
 import logging
 import pathlib
+import signal
 import tempfile
 import tomllib
 from collections.abc import AsyncIterator
@@ -33,6 +35,10 @@ DEFAULT_VOICE = "af_heart"
 SAMPLE_RATE = 24000
 SPEED = 1.2
 HUGGINGFACE_REPO = "mlx-community/Kokoro-82M-bf16"
+
+# Backlog cap. Past this, a chatty fleet of agents is queueing audio that will
+# still be playing long after the work it describes is done, so we drop instead.
+MAX_BACKLOG = 32
 
 CHANNELS_CONFIG = pathlib.Path.home() / ".config" / "tts-mcp-server" / "channels.toml"
 
@@ -77,7 +83,9 @@ def load_config(path: pathlib.Path = CHANNELS_CONFIG) -> tuple[str, dict[str, Ch
             speed=overrides.get("speed", base.speed if base else SPEED),
             priority=overrides.get("priority", base.priority if base else 10),
         )
-    logger.info("Loaded config from %s (voice=%s, %d channel(s)).", path, voice, len(channels))
+    logger.info(
+        "Loaded config from %s (voice=%s, %d channel(s)).", path, voice, len(channels)
+    )
     return voice, channels
 
 
@@ -94,8 +102,7 @@ def _resolve(
         ch = channels.get(channel)
         if ch is None:
             raise ValueError(
-                f"Unknown channel {channel!r}. "
-                f"Available: {', '.join(sorted(channels))}"
+                f"Unknown channel {channel!r}. Available: {', '.join(sorted(channels))}"
             )
         return (
             speed if speed is not None else ch.speed,
@@ -128,10 +135,13 @@ class PlaybackItem:
 class PlaybackQueue:
     """Async priority queue with a background worker that plays audio sequentially."""
 
-    def __init__(self) -> None:
+    def __init__(self, maxsize: int = MAX_BACKLOG) -> None:
         self._counter = itertools.count()
-        self._queue: asyncio.PriorityQueue[PlaybackItem] = asyncio.PriorityQueue()
+        self._queue: asyncio.PriorityQueue[PlaybackItem] = asyncio.PriorityQueue(
+            maxsize=maxsize
+        )
         self._worker: asyncio.Task[None] | None = None
+        self._current: asyncio.subprocess.Process | None = None
 
     def start(self) -> None:
         """Start the background drain task."""
@@ -149,40 +159,66 @@ class PlaybackQueue:
             self._worker = None
         logger.info("Playback worker stopped.")
 
-    def enqueue(self, audio: mx.array, priority: int = 10) -> None:
-        """Add audio to the queue. Non-blocking."""
-        self._queue.put_nowait(
-            PlaybackItem(priority, next(self._counter), audio)
-        )
+    def enqueue(self, audio: mx.array, priority: int = 10) -> bool:
+        """Add audio to the queue. Non-blocking.
+
+        :returns: False if the backlog is saturated and the audio was dropped.
+        """
+        try:
+            self._queue.put_nowait(PlaybackItem(priority, next(self._counter), audio))
+        except asyncio.QueueFull:
+            logger.warning("Backlog full (%d) — dropping audio.", self._queue.maxsize)
+            return False
+        return True
+
+    def clear(self) -> int:
+        """Discard the backlog and stop whatever is playing.
+
+        :returns: Number of queued items dropped, excluding the one playing.
+        """
+        dropped = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._queue.task_done()
+            dropped += 1
+        if self._current is not None and self._current.returncode is None:
+            self._current.terminate()
+        return dropped
 
     async def _drain(self) -> None:
         """Pull items and play them one at a time."""
         while True:
             item = await self._queue.get()
             try:
-                await _play(item.audio)
+                await self._play(item.audio)
             except Exception:
                 logger.exception("Playback failed")
             finally:
                 self._queue.task_done()
 
-
-async def _play(audio: mx.array) -> None:
-    """Write audio to a temp WAV and play via afplay."""
-    path = pathlib.Path(tempfile.mktemp(suffix=".wav", prefix="tts_"))
-    try:
-        sf.write(str(path), audio, SAMPLE_RATE)
-        proc = await asyncio.create_subprocess_exec(
-            "afplay",
-            str(path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"afplay failed: {stderr.decode()}")
-    finally:
-        path.unlink(missing_ok=True)
+    async def _play(self, audio: mx.array) -> None:
+        """Write audio to a temp WAV and play via afplay."""
+        fd, name = tempfile.mkstemp(suffix=".wav", prefix="tts_")
+        path = pathlib.Path(name)
+        try:
+            await asyncio.to_thread(_write_wav, fd, audio)
+            proc = await asyncio.create_subprocess_exec(
+                "afplay",
+                str(path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self._current = proc
+            _, stderr = await proc.communicate()
+            # -SIGTERM is how interrupt() stops playback; not a failure.
+            if proc.returncode not in (0, -signal.SIGTERM):
+                raise RuntimeError(f"afplay failed: {stderr.decode()}")
+        finally:
+            self._current = None
+            path.unlink(missing_ok=True)
 
 
 _playback: PlaybackQueue | None = None
@@ -222,10 +258,12 @@ async def notify(
     :param speed: Playback speed multiplier, 0.5–2.0.
     :param channel: Named channel for speed/priority defaults.
     """
+    playback = _require_playback()
     speed_, priority = _resolve(_channels, channel, speed)
     _validate_speed(speed_)
-    audio = generate(message, voice=_voice, speed=speed_)
-    _playback.enqueue(audio, priority=priority)
+    audio = await asyncio.to_thread(generate, message, voice=_voice, speed=speed_)
+    if not playback.enqueue(audio, priority=priority):
+        return f"Dropped (backlog full): {message}"
     return f"Notified: {message}"
 
 
@@ -243,17 +281,26 @@ async def speak(
     :param speed: Playback speed multiplier, 0.5–2.0.
     :param channel: Named channel for speed/priority defaults.
     """
+    playback = _require_playback()
     voice_ = voice if voice is not None else _voice
     speed_, priority = _resolve(_channels, channel, speed)
     _validate_speed(speed_)
-    audio = generate(text, voice=voice_, speed=speed_)
-    _playback.enqueue(audio, priority=priority)
+    audio = await asyncio.to_thread(generate, text, voice=voice_, speed=speed_)
+    if not playback.enqueue(audio, priority=priority):
+        return f"Dropped (backlog full): {len(text)} chars"
     dur = len(audio) / SAMPLE_RATE
     return f"Spoke {len(text)} chars in {dur:.1f}s (voice={voice_}, speed={speed_}x)"
 
 
+@mcp.tool()
+async def interrupt() -> str:
+    """Stop what is playing now and discard everything still queued."""
+    dropped = _require_playback().clear()
+    return f"Interrupted playback, discarded {dropped} queued item(s)."
+
+
 @functools.lru_cache
-def load_model(path: pathlib.Path = HUGGINGFACE_REPO) -> Module:
+def load_model(path: str = HUGGINGFACE_REPO) -> Module:
     logger.info("Loading model %s ...", path)
     model = mlx_load_model(path)
     # Warmup: compile Metal shaders so the first real call is fast.
@@ -263,7 +310,11 @@ def load_model(path: pathlib.Path = HUGGINGFACE_REPO) -> Module:
 
 
 def generate(text: str, voice: str = DEFAULT_VOICE, speed: float = SPEED) -> mx.array:
-    """Run TTS inference, return raw audio array."""
+    """Run TTS inference, return raw audio array.
+
+    Runs off the event loop via ``asyncio.to_thread``, so the lazy MLX graph is
+    forced here — otherwise evaluation would land back on the caller's thread.
+    """
     model = load_model()
     chunks = [
         r.audio
@@ -271,7 +322,24 @@ def generate(text: str, voice: str = DEFAULT_VOICE, speed: float = SPEED) -> mx.
     ]
     if not chunks:
         raise RuntimeError("No audio generated")
-    return mx.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+    audio = mx.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+    mx.eval(audio)
+    return audio
+
+
+def _write_wav(fd: int, audio: mx.array) -> None:
+    """Write audio as WAV to an open descriptor, closing it afterwards."""
+    with open(fd, "wb") as f:
+        sf.write(f, audio, SAMPLE_RATE, format="WAV")
+
+
+def _require_playback() -> PlaybackQueue:
+    """Fetch the live queue, or fail with something legible."""
+    if _playback is None:
+        raise RuntimeError(
+            "Playback queue is not running; the server is starting or shutting down."
+        )
+    return _playback
 
 
 def _validate_speed(speed: float) -> None:
