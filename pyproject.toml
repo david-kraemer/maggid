@@ -12,6 +12,10 @@ dependencies = [
     "sounddevice>=0.5.0",
     "numpy>=2.0",
     "soundfile>=0.12.1",
+    # server.py imports RichHandler directly. It arrives transitively through
+    # fastmcp, so the import survives without this line — until fastmcp drops it.
+    # Uncapped: RichHandler is unchanged on 15.0.
+    "rich>=14.0",
 ]
 
 [project.scripts]
