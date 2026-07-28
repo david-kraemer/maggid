@@ -15,11 +15,18 @@ the law. Fitting for a server whose only job is to say what happened.
 
 ```bash
 cd ~/projects/maggid
-uv venv && uv pip install -e .
+uv sync
 
 # Download the model (about 3 GB) and write a default config:
 uv run maggid init
 ```
+
+Use `uv sync`, not `uv pip install -e .`. The former installs the versions in
+`uv.lock`; the latter re-resolves against the looser bounds in `pyproject.toml`
+and can leave you on a different `fastmcp`. If the environment ever ends up in a
+mixed state — a stale package tree from a downgrade shows up as
+`ImportError: cannot import name ... (unknown location)` — delete `.venv` and
+sync again rather than installing over it.
 
 ### Shared daemon (recommended)
 

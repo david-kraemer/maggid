@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "macOS TTS notification server for Claude Code"
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp>=2.0.0",
+    # Capped below 3.0. The 3.x line reorganized fastmcp.server.auth, so a
+    # resolver free to cross the major boundary picks up a fastmcp that no
+    # longer imports. Raise the cap deliberately, with the tests as evidence.
+    "fastmcp>=2.14.5,<3",
     "mlx-audio>=0.4.6",
     "sounddevice>=0.5.0",
     "numpy>=2.0",
