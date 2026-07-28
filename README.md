@@ -77,15 +77,20 @@ queued narration has been overtaken by events.
 
 ## Channels
 
-Named profiles for speed and priority, so urgent speech jumps the queue.
-Defaults:
+Priority classes for the shared queue, so urgent speech jumps ahead of
+narration already waiting. Defaults:
 
-| Channel      | Speed | Priority    |
-| ------------ | ----- | ----------- |
-| `permission` | 1.0   | 1 (highest) |
-| `question`   | 1.0   | 2           |
-| `notify`     | 1.2   | 10          |
-| `narrate`    | 1.3   | 15          |
+| Channel      | Priority    |
+| ------------ | ----------- |
+| `permission` | 1 (highest) |
+| `question`   | 2           |
+| `notify`     | 10          |
+| `narrate`    | 15          |
+
+Speed is uniform at 1.1. Per-channel rates were a Kokoro-era idea that never
+earned its keep — the whole 1.0–1.3 range saved under half a second on a typical
+notification. A channel's meaning is carried by priority and by how the message
+is worded, not by how fast it is read.
 
 Override in `~/.config/tts-mcp-server/channels.toml`:
 
@@ -93,7 +98,6 @@ Override in `~/.config/tts-mcp-server/channels.toml`:
 # ref_audio = "/Users/you/.config/tts-mcp-server/voices/mine.wav"
 
 [narrate]
-speed = 1.4
 priority = 20
 ```
 
@@ -189,9 +193,12 @@ N × Claude Code  ──http──>  one daemon  ──>  Chatterbox Turbo  ─�
 - **Serialized synthesis.** MLX's Metal command buffer aborts the process if two
   threads evaluate concurrently, so all inference runs on a single dedicated
   thread. Costs nothing at ~190 ms per utterance.
+- **Persistent audio stream.** One `sounddevice` output stream stays open for
+  the process lifetime. Shelling out to `afplay` cost ~1.0 s of process and
+  CoreAudio startup per utterance — five times the synthesis time, paid on every
+  notification. Removing it also made `interrupt` near-instant (~50 ms).
 - **Speed at playback.** Chatterbox ignores a speed argument, so rate is applied
-  via `afplay -r`. Changing speed doesn't re-run inference.
-- **Temp files.** Audio is written to a temp WAV, played, then deleted.
+  by resampling before the device write, not by re-running inference.
 
 ## Troubleshooting
 
@@ -208,8 +215,9 @@ short. The server checks this up front.
 **First call slow:** the model is loading (~20 s). The daemon warms at startup;
 stdio mode loads lazily on first call.
 
-**`afplay` not found:** you're not on macOS. Replace the `afplay` call in
-`PlaybackQueue._play()` with your platform's player.
+**No audio from the daemon:** confirm it is a LaunchAgent, not a LaunchDaemon —
+only the former can reach the audio device. `sounddevice` errors surface in
+`/tmp/tts-mcp-server.err`.
 
 ## License
 
