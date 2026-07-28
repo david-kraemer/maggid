@@ -5,7 +5,7 @@ description = "macOS TTS notification server for Claude Code"
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=2.0.0",
-    "mlx-audio>=0.2.8",
+    "mlx-audio>=0.4.6",
     "soundfile>=0.12.1",
     "en_core_web_sm@https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
 ]
