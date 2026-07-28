@@ -249,21 +249,80 @@ class VoiceRegistry:
             logger.warning("Could not persist assignments to %s", self._path)
 
 
+ORDINALS = {
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
+}
+
+# A slot is reclaimed once its session has been quiet this long. Sessions do not
+# announce that they are closing, and a reconnect arrives under a fresh id, so
+# expiry is the only signal that a slot is free again.
+SESSION_TTL = 1800.0
+
+
+class SessionSlots:
+    """Separates concurrent sessions that share one workspace root.
+
+    Several terminals open on the same directory is the normal case, not an
+    edge case — five of six sessions here. Without this they would share a
+    single voice and a single label and be indistinguishable, which is the
+    whole thing identity is supposed to prevent.
+    """
+
+    def __init__(self, ttl: float = SESSION_TTL) -> None:
+        self._ttl = ttl
+        self._seen: dict[tuple[str, str], tuple[int, float]] = {}
+        self._lock = threading.Lock()
+
+    def slot(self, root: str, session_id: str | None) -> int:
+        """Which concurrent session this is for that root, 1-based."""
+        if session_id is None:
+            return 1
+        now = time.monotonic()
+        with self._lock:
+            for key, (_, seen) in list(self._seen.items()):
+                if now - seen > self._ttl:
+                    del self._seen[key]
+            key = (root, session_id)
+            if key in self._seen:
+                slot = self._seen[key][0]
+            else:
+                taken = {s for (r, _), (s, _) in self._seen.items() if r == root}
+                slot = next(i for i in itertools.count(1) if i not in taken)
+            self._seen[key] = (slot, now)
+            return slot
+
+
 _registry = VoiceRegistry()
+_slots = SessionSlots()
 _voice_overrides: dict[str, str] = {}
 _prefix_enabled: bool = True
 
 
 async def identity(ctx: Context) -> tuple[str | None, str]:
-    """Resolve the caller's workspace into a voice and a spoken label.
+    """Resolve the caller's workspace and session into a voice and spoken label.
 
     :returns: (ref_audio path or None, label — empty when unidentifiable)
     """
     root = await workspace_root(ctx)
     if root is None:
         return _ref_audio, ""
-    label = pathlib.PurePath(root).name or "workspace"
-    preset = _voice_overrides.get(label) or _registry.voice(root)
+    slot = _slots.slot(root, ctx.session_id)
+    name = pathlib.PurePath(root).name or "workspace"
+    # The first session keeps the bare name, so a workspace with only one open
+    # is never called "spade one". Later ones are numbered, and nobody is ever
+    # renamed after the fact.
+    label = name if slot == 1 else f"{name} {ORDINALS.get(slot, str(slot))}"
+    # Voices are per slot, so the second terminal on a root sounds different
+    # from the first. An explicit [voices] pin applies to the first only.
+    override = _voice_overrides.get(name) if slot == 1 else None
+    preset = override or _registry.voice(root if slot == 1 else f"{root}#{slot}")
     clip = VOICES_DIR / f"{preset}.wav"
     if not clip.is_file():
         logger.warning("Voice clip %s missing — using configured default.", clip)
