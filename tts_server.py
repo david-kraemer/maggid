@@ -8,6 +8,7 @@ cut off playback and discard the backlog.
 
 import argparse
 import asyncio
+import concurrent.futures
 import dataclasses
 import functools
 import itertools
@@ -261,7 +262,7 @@ async def notify(
     playback = _require_playback()
     speed_, priority = _resolve(_channels, channel, speed)
     _validate_speed(speed_)
-    audio = await asyncio.to_thread(generate, message, voice=_voice, speed=speed_)
+    audio = await synthesize(message, voice=_voice, speed=speed_)
     if not playback.enqueue(audio, priority=priority):
         return f"Dropped (backlog full): {message}"
     return f"Notified: {message}"
@@ -285,7 +286,7 @@ async def speak(
     voice_ = voice if voice is not None else _voice
     speed_, priority = _resolve(_channels, channel, speed)
     _validate_speed(speed_)
-    audio = await asyncio.to_thread(generate, text, voice=voice_, speed=speed_)
+    audio = await synthesize(text, voice=voice_, speed=speed_)
     if not playback.enqueue(audio, priority=priority):
         return f"Dropped (backlog full): {len(text)} chars"
     dur = len(audio) / SAMPLE_RATE
@@ -297,6 +298,24 @@ async def interrupt() -> str:
     """Stop what is playing now and discard everything still queued."""
     dropped = _require_playback().clear()
     return f"Interrupted playback, discarded {dropped} queued item(s)."
+
+
+# MLX's Metal command buffer is not safe for concurrent evaluation — two
+# threads calling generate() at once aborts the process with
+# "Completed handler provided after commit call". The lru_cache on load_model
+# is likewise not atomic, so a concurrent cold start races inside transformers.
+# One synthesis thread fixes both, and costs nothing: inference is ~60 ms.
+_synthesis = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="tts-synth"
+)
+
+
+async def synthesize(text: str, voice: str = DEFAULT_VOICE, speed: float = SPEED):
+    """Run TTS inference off the event loop, serialized against other callers."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _synthesis, functools.partial(generate, text, voice=voice, speed=speed)
+    )
 
 
 @functools.lru_cache
