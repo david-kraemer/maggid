@@ -7,14 +7,15 @@ for general-purpose TTS with voice/speed control.
 
 import argparse
 import asyncio
+import dataclasses
 import functools
 import itertools
 import logging
 import pathlib
 import tempfile
+import tomllib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-import dataclasses
 
 import mlx.core as mx
 import soundfile as sf
@@ -32,6 +33,82 @@ DEFAULT_VOICE = "af_heart"
 SAMPLE_RATE = 24000
 SPEED = 1.2
 HUGGINGFACE_REPO = "mlx-community/Kokoro-82M-bf16"
+
+CHANNELS_CONFIG = pathlib.Path.home() / ".config" / "tts-mcp-server" / "channels.toml"
+
+
+# ---------------------------------------------------------------------------
+# Channels — named voice/speed/priority profiles
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class Channel:
+    speed: float
+    priority: int
+
+
+DEFAULT_CHANNELS: dict[str, Channel] = {
+    "notify": Channel(speed=1.2, priority=10),
+    "permission": Channel(speed=1.0, priority=1),
+    "question": Channel(speed=1.0, priority=2),
+    "narrate": Channel(speed=1.3, priority=15),
+}
+
+
+def load_config(path: pathlib.Path = CHANNELS_CONFIG) -> tuple[str, dict[str, Channel]]:
+    """Load voice and channel config from TOML, falling back to defaults.
+
+    :returns: (voice, channels)
+    """
+    voice = DEFAULT_VOICE
+    channels = dict(DEFAULT_CHANNELS)
+    if not path.is_file():
+        logger.info("No config at %s — using defaults.", path)
+        return voice, channels
+    with open(path, "rb") as f:
+        raw = tomllib.load(f)
+    voice = raw.get("voice", DEFAULT_VOICE)
+    for name, overrides in raw.items():
+        if not isinstance(overrides, dict):
+            continue
+        base = DEFAULT_CHANNELS.get(name)
+        channels[name] = Channel(
+            speed=overrides.get("speed", base.speed if base else SPEED),
+            priority=overrides.get("priority", base.priority if base else 10),
+        )
+    logger.info("Loaded config from %s (voice=%s, %d channel(s)).", path, voice, len(channels))
+    return voice, channels
+
+
+def _resolve(
+    channels: dict[str, Channel],
+    channel: str | None,
+    speed: float | None,
+) -> tuple[float, int]:
+    """Merge explicit speed over channel defaults.
+
+    :returns: (speed, priority)
+    """
+    if channel is not None:
+        ch = channels.get(channel)
+        if ch is None:
+            raise ValueError(
+                f"Unknown channel {channel!r}. "
+                f"Available: {', '.join(sorted(channels))}"
+            )
+        return (
+            speed if speed is not None else ch.speed,
+            ch.priority,
+        )
+    return (
+        speed if speed is not None else SPEED,
+        10,
+    )
+
+
+_voice: str = DEFAULT_VOICE
+_channels: dict[str, Channel] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +196,8 @@ _playback: PlaybackQueue | None = None
 @asynccontextmanager
 async def lifespan(_server: FastMCP) -> AsyncIterator[dict]:
     """Start/stop the playback worker with the server lifecycle."""
-    global _playback
+    global _playback, _voice, _channels
+    _voice, _channels = load_config()
     _playback = PlaybackQueue()
     _playback.start()
     try:
@@ -133,30 +211,45 @@ mcp = FastMCP("TTS Notification Server", lifespan=lifespan)
 
 
 @mcp.tool()
-async def notify(message: str, speed: float = SPEED) -> str:
+async def notify(
+    message: str,
+    speed: float | None = None,
+    channel: str | None = None,
+) -> str:
     """Speak a short task-completion notification.
 
     :param message: Notification text (e.g. "Build finished").
+    :param speed: Playback speed multiplier, 0.5–2.0.
+    :param channel: Named channel for speed/priority defaults.
     """
-    _validate_speed(speed)
-    audio = generate(message, speed=speed)
-    _playback.enqueue(audio)
+    speed_, priority = _resolve(_channels, channel, speed)
+    _validate_speed(speed_)
+    audio = generate(message, voice=_voice, speed=speed_)
+    _playback.enqueue(audio, priority=priority)
     return f"Notified: {message}"
 
 
 @mcp.tool()
-async def speak(text: str, voice: str = DEFAULT_VOICE, speed: float = SPEED) -> str:
+async def speak(
+    text: str,
+    voice: str | None = None,
+    speed: float | None = None,
+    channel: str | None = None,
+) -> str:
     """Generate and play speech with voice and speed control.
 
     :param text: Text to speak.
-    :param voice: Kokoro voice preset
+    :param voice: Kokoro voice preset (overrides instance default).
     :param speed: Playback speed multiplier, 0.5–2.0.
+    :param channel: Named channel for speed/priority defaults.
     """
-    _validate_speed(speed)
-    audio = generate(text, voice=voice, speed=speed)
-    _playback.enqueue(audio)
+    voice_ = voice if voice is not None else _voice
+    speed_, priority = _resolve(_channels, channel, speed)
+    _validate_speed(speed_)
+    audio = generate(text, voice=voice_, speed=speed_)
+    _playback.enqueue(audio, priority=priority)
     dur = len(audio) / SAMPLE_RATE
-    return f"Spoke {len(text)} chars in {dur:.1f}s (voice={voice}, speed={speed}x)"
+    return f"Spoke {len(text)} chars in {dur:.1f}s (voice={voice_}, speed={speed_}x)"
 
 
 @functools.lru_cache
@@ -193,7 +286,25 @@ def main():
     mcp.run(transport="stdio")
 
 
+def write_default_config(path: pathlib.Path = CHANNELS_CONFIG) -> bool:
+    """Write default channels.toml if it doesn't exist.
+
+    :returns: True if file was created, False if it already existed.
+    """
+    if path.is_file():
+        logger.info("Config already exists at %s — skipping.", path)
+        return False
+    lines = [f'voice = "{DEFAULT_VOICE}"', ""]
+    for name, ch in DEFAULT_CHANNELS.items():
+        lines += [f"[{name}]", f"speed = {ch.speed}", f"priority = {ch.priority}", ""]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines))
+    logger.info("Wrote default config to %s.", path)
+    return True
+
+
 def init():
+    write_default_config()
     load_model()
 
 
