@@ -100,10 +100,42 @@ priority = 20
 The backlog is capped at 32 utterances; past that, new audio is dropped rather
 than queued behind speech that will be stale by the time it plays.
 
+## Per-workspace identity
+
+With several agents running, the useful question is not "what did it say" but
+"which one said it". The daemon answers that two ways at once.
+
+**A spoken label.** Each message is prefixed with the workspace directory name,
+so `notify("Tests passed")` from `~/projects/spade` is heard as *"spade. Tests
+passed."* Disable with `prefix = false`.
+
+**A distinct voice per workspace.** The server reads the client's advertised
+root via MCP `roots`, and assigns a voice from a pool of nine on first contact.
+Assignments persist in `~/.config/tts-mcp-server/assignments.json` and are keyed
+on the root path, so they survive daemon restarts.
+
+Pin one explicitly if you'd rather not take what you're given:
+
+```toml
+[voices]
+spade = "bm_daniel"
+```
+
+**Why the label does the heavy lifting.** The nine pooled voices were picked by
+rating every cloned candidate 1–10 and then solving for the subset with maximum
+minimum pairwise separation (speaker-embedding cosine). Even so, the best
+possible nine still contain a pair at 0.86 cosine — Chatterbox pulls everything
+it clones toward its own character, compressing the whole set into 0.74–0.90.
+Voice alone reliably distinguishes four or five workspaces, not nine. The label
+is what actually scales; the voice reinforces it.
+
+Past nine workspaces the pool wraps deterministically, and two projects share a
+voice. Only the label tells them apart at that point.
+
 ## Voices
 
-Chatterbox has no voice presets. It clones from a reference clip, which is what
-lifts the per-workspace-voice ceiling — but it means you supply the clips.
+Chatterbox has no voice presets. It clones from a reference clip — which is what
+lifts the ceiling — but it means you supply the clips.
 
 Reference clips must be **longer than 5 seconds**. The easiest source that
 involves no one's actual voice is to synthesize them from Kokoro's presets:
