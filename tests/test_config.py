@@ -4,7 +4,7 @@ import tomllib
 
 import pytest
 
-from tts_server import config as cfg
+from maggid import config as cfg
 
 
 def test_missing_file_gives_defaults(tmp_path):

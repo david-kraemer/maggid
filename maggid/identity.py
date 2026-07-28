@@ -10,7 +10,7 @@ import urllib.parse
 
 from fastmcp import Context
 
-from tts_server.config import CONFIG_DIR, Config
+from maggid.config import CONFIG_DIR, Config
 
 logger = logging.getLogger(__name__)
 

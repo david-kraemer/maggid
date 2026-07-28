@@ -4,8 +4,8 @@ import asyncio
 
 import pytest
 
-from tts_server import identity
-from tts_server.config import Config
+from maggid import identity
+from maggid.config import Config
 
 # --- names ---------------------------------------------------------------
 

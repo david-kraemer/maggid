@@ -5,7 +5,7 @@ import asyncio
 import mlx.core as mx
 import numpy as np
 
-from tts_server import playback
+from maggid import playback
 
 
 def _audio(n: int = 8) -> mx.array:

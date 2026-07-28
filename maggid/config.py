@@ -10,7 +10,7 @@ import soundfile
 
 logger = logging.getLogger(__name__)
 
-CONFIG_DIR = pathlib.Path.home() / ".config" / "tts-mcp-server"
+CONFIG_DIR = pathlib.Path.home() / ".config" / "maggid"
 CONFIG_FILE = CONFIG_DIR / "channels.toml"
 
 # Chatterbox refuses a shorter clip: "Audio prompt must be longer than 5
@@ -115,7 +115,7 @@ CONFIG_TEMPLATE = """\
 prefix = true
 
 # Fallback clip for an unidentified workspace. Omit it for the built-in voice.
-# ref_audio = "/Users/you/.config/tts-mcp-server/voices/refs/af_heart.wav"
+# ref_audio = "/Users/you/.config/maggid/voices/refs/af_heart.wav"
 
 # Pin a workspace to a voice. Keys are directory names. Values are presets in
 # voices/refs/. An unpinned workspace gets a voice on first contact, kept in

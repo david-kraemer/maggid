@@ -5,9 +5,9 @@ import asyncio
 import mlx.core as mx
 import pytest
 
-from tts_server import identity, server
-from tts_server.config import Config
-from tts_server.playback import PlaybackQueue
+from maggid import identity, server
+from maggid.config import Config
+from maggid.playback import PlaybackQueue
 
 
 @pytest.fixture

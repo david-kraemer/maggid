@@ -11,15 +11,15 @@ from contextlib import asynccontextmanager
 from fastmcp import Context, FastMCP
 from rich.logging import RichHandler
 
-from tts_server import identity, synth
-from tts_server.config import (
+from maggid import identity, synth
+from maggid.config import (
     Config,
     channel_priority,
     load_config,
     validate_ref_audio,
     write_default_config,
 )
-from tts_server.playback import SAMPLE_RATE, SPEED, PlaybackQueue
+from maggid.playback import SAMPLE_RATE, SPEED, PlaybackQueue
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[dict]:
         _runtime = None
 
 
-mcp = FastMCP("TTS Notification Server", lifespan=lifespan)
+mcp = FastMCP("Maggid", lifespan=lifespan)
 
 
 @mcp.tool()
@@ -168,10 +168,12 @@ def main(argv: list[str] | None = None) -> None:
     _warm_at_start = args.warm if args.warm is not None else args.transport == "http"
 
     if args.transport == "http":
-        logger.info("Starting the shared TTS daemon on %s:%d ...", args.host, args.port)
+        logger.info(
+            "Starting the shared maggid daemon on %s:%d ...", args.host, args.port
+        )
         mcp.run(transport="http", host=args.host, port=args.port)
     else:
-        logger.info("Starting the TTS MCP server on stdio ...")
+        logger.info("Starting maggid on stdio ...")
         mcp.run(transport="stdio")
 
 
@@ -189,7 +191,7 @@ def _configure_logging() -> None:
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="tts-mcp-server",
+        prog="maggid",
         description="TTS MCP server for Claude Code. Chatterbox Turbo on Apple "
         "Silicon.",
         epilog="Run without arguments for a per-session stdio server.",

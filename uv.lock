@@ -731,6 +731,39 @@ wheels = [
 ]
 
 [[package]]
+name = "maggid"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "fastmcp" },
+    { name = "mlx-audio" },
+    { name = "numpy" },
+    { name = "sounddevice" },
+    { name = "soundfile" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastmcp", specifier = ">=2.0.0" },
+    { name = "mlx-audio", specifier = ">=0.4.6" },
+    { name = "numpy", specifier = ">=2.0" },
+    { name = "sounddevice", specifier = ">=0.5.0" },
+    { name = "soundfile", specifier = ">=0.12.1" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "ruff", specifier = ">=0.6" },
+]
+
+[[package]]
 name = "markdown-it-py"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1999,39 +2032,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/aa/7c/8240f612819718100a9346dc28dea6a11370c3ca9c8c6eabadd3dea4ef29/transformers-5.12.1.tar.gz", hash = "sha256:679ee731c8225347889ad4fb3b2c926a62e9da3b7d284e9d12c791da7272466b", size = 8924054, upload-time = "2026-06-15T17:27:50.604Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/df/56/bbd60dd8668055803bf8ba55a81f9b8a8b31497f620109a9671d26a2076d/transformers-5.12.1-py3-none-any.whl", hash = "sha256:2a5e109d2021265df7098ffbb738295acaf5ad256f12cbc586db2ea4dcbb1a8a", size = 11150587, upload-time = "2026-06-15T17:27:46.679Z" },
-]
-
-[[package]]
-name = "tts-mcp-server"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "fastmcp" },
-    { name = "mlx-audio" },
-    { name = "numpy" },
-    { name = "sounddevice" },
-    { name = "soundfile" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "fastmcp", specifier = ">=2.0.0" },
-    { name = "mlx-audio", specifier = ">=0.4.6" },
-    { name = "numpy", specifier = ">=2.0" },
-    { name = "sounddevice", specifier = ">=0.5.0" },
-    { name = "soundfile", specifier = ">=0.12.1" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "ruff", specifier = ">=0.6" },
 ]
 
 [[package]]

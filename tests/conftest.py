@@ -4,7 +4,7 @@ import types
 
 import pytest
 
-from tts_server import identity
+from maggid import identity
 
 
 class FakeContext:

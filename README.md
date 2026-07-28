@@ -1,4 +1,4 @@
-# tts-mcp-server
+# maggid
 
 Local text-to-speech for Claude Code over [MCP](https://modelcontextprotocol.io/).
 Runs [Chatterbox Turbo](https://huggingface.co/ResembleAI/chatterbox-turbo) on
@@ -6,16 +6,19 @@ Apple Silicon through [MLX-audio](https://github.com/Blaizzy/mlx-audio). Claude
 speaks its notifications and narration aloud, with a distinct voice per workspace
 when several agents run at once.
 
+A *maggid* is an itinerant preacher — one who tells, as against one who rules on
+the law. Fitting for a server whose only job is to say what happened.
+
 **Requirements:** macOS on Apple Silicon, Python 3.12 or later.
 
 ## Setup
 
 ```bash
-cd ~/projects/tts-mcp-server
+cd ~/projects/maggid
 uv venv && uv pip install -e .
 
 # Download the model (about 3 GB) and write a default config:
-uv run tts-mcp-server init
+uv run maggid init
 ```
 
 ### Shared daemon (recommended)
@@ -24,11 +27,11 @@ One process serves every Claude Code session. Run this mode if you keep more
 than one or two sessions open.
 
 ```bash
-sed "s|__VENV__|$PWD/.venv|g" launchd/com.tts-mcp-server.plist \
-  > ~/Library/LaunchAgents/com.tts-mcp-server.plist
-launchctl load ~/Library/LaunchAgents/com.tts-mcp-server.plist
+sed "s|__VENV__|$PWD/.venv|g" launchd/com.maggid.plist \
+  > ~/Library/LaunchAgents/com.maggid.plist
+launchctl load ~/Library/LaunchAgents/com.maggid.plist
 
-claude mcp add --transport http --scope user tts http://127.0.0.1:8765/mcp
+claude mcp add --transport http --scope user maggid http://127.0.0.1:8765/mcp
 ```
 
 Per-session servers each load their own copy of the model and own their own
@@ -43,8 +46,8 @@ not on the first message.
 ### Per-session stdio (fallback)
 
 ```bash
-claude mcp add --transport stdio --scope user tts -- \
-  /path/to/tts-mcp-server/.venv/bin/tts-mcp-server
+claude mcp add --transport stdio --scope user maggid -- \
+  /path/to/maggid/.venv/bin/maggid
 ```
 
 Simpler, with no lifecycle to manage. The server lives exactly as long as its
@@ -87,7 +90,7 @@ Per-channel rates were a Kokoro-era idea that never earned its keep: the whole
 1.0-to-1.3 range saved under half a second on a typical notification. Priority
 and wording carry a channel's meaning better than speed does.
 
-Override priorities in `~/.config/tts-mcp-server/channels.toml`:
+Override priorities in `~/.config/maggid/channels.toml`:
 
 ```toml
 [narrate]
@@ -108,7 +111,7 @@ passed."* Set `prefix = false` to turn this off.
 
 **A distinct voice per workspace.** The server reads the client's advertised root
 through MCP `roots` and assigns a voice from a pool of nine on first contact.
-Assignments live in `~/.config/tts-mcp-server/assignments.json`, keyed on the
+Assignments live in `~/.config/maggid/assignments.json`, keyed on the
 root path, so they survive a daemon restart.
 
 Pin one if you would rather not take what you are given:
@@ -236,13 +239,13 @@ ordering, and resampling. None of them load the model or open the audio device.
 
 ## Troubleshooting
 
-**Daemon not reachable.** Run `launchctl list | grep tts`, then read
-`/tmp/tts-mcp-server.err`. Claude Code reconnects on its next tool call. Only the
+**Daemon not reachable.** Run `launchctl list | grep maggid`, then read
+`/tmp/maggid.err`. Claude Code reconnects on its next tool call. Only the
 utterance in flight is lost.
 
 **No audio from the daemon.** Confirm it is a LaunchAgent, not a LaunchDaemon.
 Only a LaunchAgent can reach the audio device. `sounddevice` errors appear in
-`/tmp/tts-mcp-server.err`.
+`/tmp/maggid.err`.
 
 **"Audio prompt must be longer than 5 seconds".** Your `ref_audio` clip is too
 short. The server checks this before it calls the model.

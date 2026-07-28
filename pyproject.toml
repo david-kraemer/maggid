@@ -1,5 +1,5 @@
 [project]
-name = "tts-mcp-server"
+name = "maggid"
 version = "0.1.0"
 description = "macOS TTS notification server for Claude Code"
 requires-python = ">=3.12"
@@ -12,8 +12,8 @@ dependencies = [
 ]
 
 [project.scripts]
-tts-mcp-server = "tts_server:main"
-tts-mcp-init = "tts_server:init"
+maggid = "maggid:main"
+maggid-init = "maggid:init"
 
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6"]
@@ -23,7 +23,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["tts_server"]
+packages = ["maggid"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
