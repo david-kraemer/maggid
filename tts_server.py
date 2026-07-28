@@ -249,21 +249,130 @@ class VoiceRegistry:
             logger.warning("Could not persist assignments to %s", self._path)
 
 
+# Concurrent sessions on one root are named rather than numbered. "cfd Bonnie"
+# and "cfd Colin" are far easier to tell apart mid-task than "cfd two" and
+# "cfd three", where the only contrast is an unstressed final syllable.
+#
+# From the NHC's 2028 Atlantic list, split by gender and ordered most-familiar
+# first. The name follows the gender of the assigned voice — a male name spoken
+# in a female voice is more confusing than a bare number. "Alex" is dropped
+# despite being on the list, being ambiguous in English.
+FEMALE_NAMES = (
+    "Bonnie",
+    "Danielle",
+    "Julia",
+    "Lisa",
+    "Nicole",
+    "Paula",
+    "Farrah",
+    "Hermine",
+    "Shary",
+    "Virginie",
+)
+MALE_NAMES = (
+    "Colin",
+    "Earl",
+    "Martin",
+    "Owen",
+    "Richard",
+    "Karl",
+    "Walter",
+    "Gaston",
+    "Idris",
+    "Tobias",
+)
+
+
+def _names_for_pool() -> dict[str, str]:
+    """One name per pooled voice, gender-matched.
+
+    Deriving the name from the voice rather than the slot number means the two
+    can never disagree, and distinct voices guarantee distinct names for free.
+    Kokoro presets encode gender in their second character (af_/am_/bf_/bm_).
+    """
+    women, men = iter(FEMALE_NAMES), iter(MALE_NAMES)
+    return {v: next(women if v[1] == "f" else men) for v in VOICE_POOL}
+
+
+VOICE_NAMES = _names_for_pool()
+
+# A slot is reclaimed once its session has been quiet this long. Sessions do not
+# announce that they are closing, and a reconnect arrives under a fresh id, so
+# expiry is the only signal that a slot is free again.
+SESSION_TTL = 1800.0
+
+
+class SessionSlots:
+    """Separates concurrent sessions that share one workspace root.
+
+    Several terminals open on the same directory is the normal case, not an
+    edge case — five of six sessions here. Without this they would share a
+    single voice and a single label and be indistinguishable, which is the
+    whole thing identity is supposed to prevent.
+    """
+
+    def __init__(self, ttl: float = SESSION_TTL) -> None:
+        self._ttl = ttl
+        self._seen: dict[tuple[str, str], tuple[int, float]] = {}
+        self._lock = threading.Lock()
+
+    def slot(self, root: str, session_id: str | None) -> int:
+        """Which concurrent session this is for that root, 1-based."""
+        if session_id is None:
+            return 1
+        now = time.monotonic()
+        with self._lock:
+            for key, (_, seen) in list(self._seen.items()):
+                if now - seen > self._ttl:
+                    del self._seen[key]
+            key = (root, session_id)
+            if key in self._seen:
+                slot = self._seen[key][0]
+            else:
+                taken = {s for (r, _), (s, _) in self._seen.items() if r == root}
+                slot = next(i for i in itertools.count(1) if i not in taken)
+            self._seen[key] = (slot, now)
+            return slot
+
+
 _registry = VoiceRegistry()
+_slots = SessionSlots()
 _voice_overrides: dict[str, str] = {}
 _prefix_enabled: bool = True
 
 
+def _session_name(preset: str, slot: int) -> str:
+    """Spoken name for a session, matching the gender of its voice.
+
+    Falls back to the slot number for a voice outside the pool — an explicit
+    [voices] pin, say — rather than risk a mismatched name.
+    """
+    if preset in VOICE_NAMES:
+        return VOICE_NAMES[preset]
+    if len(preset) > 1 and preset[1] in "fm":
+        pool = FEMALE_NAMES if preset[1] == "f" else MALE_NAMES
+        return pool[slot % len(pool)]
+    return str(slot)
+
+
 async def identity(ctx: Context) -> tuple[str | None, str]:
-    """Resolve the caller's workspace into a voice and a spoken label.
+    """Resolve the caller's workspace and session into a voice and spoken label.
 
     :returns: (ref_audio path or None, label — empty when unidentifiable)
     """
     root = await workspace_root(ctx)
     if root is None:
         return _ref_audio, ""
-    label = pathlib.PurePath(root).name or "workspace"
-    preset = _voice_overrides.get(label) or _registry.voice(root)
+    slot = _slots.slot(root, ctx.session_id)
+    name = pathlib.PurePath(root).name or "workspace"
+    # Voices are per slot, so the second terminal on a root sounds different
+    # from the first. An explicit [voices] pin applies to the first only.
+    override = _voice_overrides.get(name) if slot == 1 else None
+    preset = override or _registry.voice(root if slot == 1 else f"{root}#{slot}")
+    # Resolved after the voice, because the name has to match its gender. The
+    # first session keeps the bare workspace name, so a workspace with only one
+    # open is never called "spade Colin", and nobody is renamed after the fact.
+    label = name if slot == 1 else f"{name} {_session_name(preset, slot)}"
     clip = VOICES_DIR / f"{preset}.wav"
     if not clip.is_file():
         logger.warning("Voice clip %s missing — using configured default.", clip)
