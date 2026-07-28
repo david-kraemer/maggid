@@ -8,8 +8,8 @@
       > ~/Library/LaunchAgents/com.tts-mcp-server.plist
     launchctl load ~/Library/LaunchAgents/com.tts-mcp-server.plist
 
-  A LaunchAgent (not a LaunchDaemon) is required: LaunchDaemons run outside the
-  user's GUI session and cannot reach the audio device, so afplay would fail.
+  This must be a LaunchAgent, not a LaunchDaemon. A LaunchDaemon runs outside
+  the user's GUI session and cannot reach the audio device.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
