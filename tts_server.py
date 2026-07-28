@@ -16,6 +16,7 @@ import logging
 import pathlib
 import signal
 import tempfile
+import time
 import tomllib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -54,6 +55,14 @@ MIN_REF_SECONDS = 5.0
 MAX_BACKLOG = 32
 
 CHANNELS_CONFIG = pathlib.Path.home() / ".config" / "tts-mcp-server" / "channels.toml"
+
+# Shared-daemon defaults. One process serving every session means one model in
+# memory instead of one per session, one warmup instead of N, and — the point —
+# a single playback queue, so an urgent channel in one workspace preempts
+# narration in another. Loopback only: an open port here lets any local process
+# make the machine talk.
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +152,7 @@ def _resolve(
 
 _ref_audio: str | None = None
 _channels: dict[str, Channel] = {}
+_warm_on_start: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +278,30 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[dict]:
     _ref_audio, _channels = load_config()
     _playback = PlaybackQueue()
     _playback.start()
+    # Warm the model off the critical path. Loading takes ~20 s, which a
+    # long-lived daemon should absorb at login rather than charging to whoever
+    # sends the first notification. The transport is already listening, so the
+    # handshake stays instant either way.
+    warm = asyncio.create_task(_warmup()) if _warm_on_start else None
     try:
         yield {}
     finally:
+        if warm is not None:
+            warm.cancel()
         await _playback.stop()
         _playback = None
+
+
+async def _warmup() -> None:
+    """Load the model in the synthesis thread, logging rather than raising."""
+    try:
+        t0 = time.monotonic()
+        await asyncio.get_running_loop().run_in_executor(_synthesis, load_model)
+        logger.info("Warmup finished in %.1fs.", time.monotonic() - t0)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Warmup failed; first call will pay the load cost")
 
 
 mcp = FastMCP("TTS Notification Server", lifespan=lifespan)
@@ -430,11 +459,63 @@ def _validate_speed(speed: float) -> None:
         raise ValueError(f"Speed must be {MIN_SPEED}–{MAX_SPEED}, got {speed}")
 
 
-def main():
-    logger.info("Starting TTS MCP server ...")
-    # Start the MCP transport immediately so the handshake succeeds,
-    # then warm up the model lazily on first tool call.
-    mcp.run(transport="stdio")
+def main(argv: list[str] | None = None) -> None:
+    """Run the server. Argument parsing lives here so the console script sees it."""
+    global _warm_on_start
+    args = _parse_args(argv)
+
+    if args.command == "init":
+        logger.info("Preloading model for faster first response...")
+        init()
+        return
+
+    # Warm eagerly when we're the shared daemon, lazily when we're a per-session
+    # stdio child that may never be asked to speak at all.
+    _warm_on_start = args.warm if args.warm is not None else args.transport == "http"
+
+    if args.transport == "http":
+        logger.info("Starting shared TTS daemon on %s:%d ...", args.host, args.port)
+        mcp.run(transport="http", host=args.host, port=args.port)
+    else:
+        logger.info("Starting TTS MCP server (stdio) ...")
+        mcp.run(transport="stdio")
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="tts-mcp-server",
+        description="TTS MCP server for Claude Code — Chatterbox Turbo on Apple Silicon.",
+        epilog="Run without arguments for a per-session stdio server.",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["init"],
+        default=None,
+        help="'init' to pre-download the TTS model and write a default config.",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help="'http' runs one shared daemon for every session (default: stdio).",
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help="HTTP bind address.")
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help="HTTP port to listen on."
+    )
+    warm = parser.add_mutually_exclusive_group()
+    warm.add_argument(
+        "--warm",
+        dest="warm",
+        action="store_true",
+        default=None,
+        help="Load the model at startup instead of on first call.",
+    )
+    warm.add_argument(
+        "--no-warm", dest="warm", action="store_false", help="Always load lazily."
+    )
+    return parser.parse_args(argv)
 
 
 def write_default_config(path: pathlib.Path = CHANNELS_CONFIG) -> bool:
@@ -464,21 +545,4 @@ def init():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="TTS MCP server for Claude Code — Kokoro-82M on Apple Silicon.",
-        epilog="Run without arguments to start the MCP server.",
-    )
-    parser.add_argument(
-        "command",
-        nargs="?",
-        choices=["init"],
-        default=None,
-        help="'init' to pre-download the TTS model (~200 MB).",
-    )
-    args = parser.parse_args()
-
-    if args.command == "init":
-        logger.info("Preloading model for faster first response...")
-        init()
-    else:
-        main()
+    main()
