@@ -35,6 +35,10 @@ class Name(TypedDict):
     sex: Sex
 
 
+# Kokoro encodes sex in the second character of a preset id: af_, am_, bf_, bm_.
+SEX_BY_LETTER: Mapping[str, Sex] = {"f": "female", "m": "male"}
+
+
 # Rated every cloned candidate, kept the ones at 8 or better, then took the subset
 # with the largest minimum pairwise distance (speaker-embedding cosine). Best-rated
 # first, which is also assignment order, so the first workspace seen gets the best
@@ -127,6 +131,17 @@ def _names_for_pool() -> Mapping[str, str]:
 VOICE_NAMES = _names_for_pool()
 
 
+def next_voice(assigned: Mapping[str, str]) -> str:
+    """An unused voice, or a wrapped one once the pool runs out.
+
+    Past nine workspaces two roots share a voice, and only the spoken label tells
+    them apart. The wrap is deterministic, so it is at least stable.
+    """
+    used = set(assigned.values())
+    free = [v for v in VOICE_IDS if v not in used]
+    return free[0] if free else VOICE_IDS[len(assigned) % len(VOICE_IDS)]
+
+
 class VoiceRegistry:
     """Assigns a stable voice per workspace. Survives a daemon restart.
 
@@ -148,20 +163,10 @@ class VoiceRegistry:
     def voice(self, root: str) -> str:
         """Preset for this workspace. Allocates one on first sight."""
         if root not in self._map:
-            self._map[root] = self._allocate()
+            self._map[root] = next_voice(self._map)
             logger.info("Assigned voice %s to %s", self._map[root], root)
             self._save()
         return self._map[root]
-
-    def _allocate(self) -> str:
-        """An unused voice, or a wrapped one once the pool runs out.
-
-        Past nine workspaces two roots share a voice, and only the spoken label
-        tells them apart. The wrap is deterministic, so it is at least stable.
-        """
-        used = set(self._map.values())
-        free = [v for v in VOICE_IDS if v not in used]
-        return free[0] if free else VOICE_IDS[len(self._map) % len(VOICE_IDS)]
 
     def _save(self) -> None:
         try:
@@ -171,42 +176,61 @@ class VoiceRegistry:
             logger.warning("Could not persist assignments to %s", self._path)
 
 
+# Slot table: which numbered session holds a root, and when it last spoke.
+type Seen = Mapping[tuple[str, str], tuple[int, float]]
+
+
+def unexpired(seen: Seen, now: float, ttl: float) -> Seen:
+    """The table without slots whose session has gone quiet."""
+    return {key: value for key, value in seen.items() if now - value[1] <= ttl}
+
+
+def lowest_free(seen: Seen, root: str) -> int:
+    """Lowest slot number unused on the root. Starts at 1."""
+    taken = {slot for (r, _), (slot, _) in seen.items() if r == root}
+    return next(i for i in itertools.count(1) if i not in taken)
+
+
+def assign_slot(
+    seen: Seen, root: str, session_id: str, now: float, ttl: float
+) -> tuple[Seen, int]:
+    """The slot this session holds, and the table it leaves behind.
+
+    Pure, so the caller owns both the clock and the state. Expiry happens here
+    rather than on a timer because sessions do not announce that they close, and a
+    reconnect arrives under a fresh id.
+
+    :returns: (table including this session's slot; the slot number)
+    """
+    live = unexpired(seen, now, ttl)
+    key = (root, session_id)
+    slot = live[key][0] if key in live else lowest_free(live, root)
+    return {**live, key: (slot, now)}, slot
+
+
 class SessionSlots:
     """Separates concurrent sessions that share one workspace root.
 
     Several terminals on one directory is the normal case, not an edge case.
     Without slots they share a voice and a label, which defeats the purpose.
+
+    A lock and a clock around assign_slot. All the reasoning lives there.
     """
 
     def __init__(self, ttl: float = SESSION_TTL) -> None:
         self._ttl = ttl
-        self._seen: dict[tuple[str, str], tuple[int, float]] = {}
+        self._seen: Seen = {}
         self._lock = threading.Lock()
 
     def slot(self, root: str, session_id: str | None) -> int:
         """Which concurrent session this is for the root. Starts at 1."""
         if session_id is None:
             return 1
-        now = time.monotonic()
         with self._lock:
-            self._expire(now)
-            key = (root, session_id)
-            slot = self._seen[key][0] if key in self._seen else self._free(root)
-            self._seen[key] = (slot, now)
+            self._seen, slot = assign_slot(
+                self._seen, root, session_id, time.monotonic(), self._ttl
+            )
             return slot
-
-    def _expire(self, now: float) -> None:
-        """Drop slots whose session went quiet. The caller holds the lock."""
-        self._seen = {
-            key: value
-            for key, value in self._seen.items()
-            if now - value[1] <= self._ttl
-        }
-
-    def _free(self, root: str) -> int:
-        """Lowest slot number unused on the root. The caller holds the lock."""
-        taken = {slot for (r, _), (slot, _) in self._seen.items() if r == root}
-        return next(i for i in itertools.count(1) if i not in taken)
 
 
 async def speaker(
@@ -221,20 +245,41 @@ async def speaker(
     if root is None:
         return config.ref_audio, ""
     slot = slots.slot(root, ctx.session_id)
-    name = pathlib.PurePath(root).name or "workspace"
+    name = workspace_name(root)
     # Voices are per slot, so the second terminal on a root sounds different from
     # the first. A [voices] pin applies to the first slot only.
     pinned = config.voices.get(name) if slot == 1 else None
-    preset = pinned or voices.voice(root if slot == 1 else f"{root}#{slot}")
-    # The label comes after the voice, because the name must match the voice
-    # gender. Slot 1 keeps the bare workspace name, so a lone session is never
-    # called "spade Colin", and no session is renamed later.
-    label = name if slot == 1 else f"{name} {session_name(preset, slot)}"
+    preset = pinned or voices.voice(voice_key(root, slot))
+    # The label comes after the voice, because the name must match the voice sex.
+    label = workspace_label(name, slot, preset)
     clip = VOICES_DIR / f"{preset}.wav"
     if not clip.is_file():
         logger.warning("Voice clip %s is missing. Using the default voice.", clip)
         return config.ref_audio, label
     return clip, label
+
+
+def workspace_name(root: str) -> str:
+    """Spoken stem of a workspace root."""
+    return pathlib.PurePath(root).name or "workspace"
+
+
+def voice_key(root: str, slot: int) -> str:
+    """Registry key for a session. Slot 1 owns the root; later slots hang off it.
+
+    This shape reaches assignments.json, so changing it orphans every voice a user
+    has already been given.
+    """
+    return root if slot == 1 else f"{root}#{slot}"
+
+
+def workspace_label(name: str, slot: int, preset: str) -> str:
+    """What the listener hears before the message.
+
+    Slot 1 keeps the bare workspace name, so a lone session is never called "spade
+    Colin", and no session is renamed once a second one appears.
+    """
+    return name if slot == 1 else f"{name} {session_name(preset, slot)}"
 
 
 def session_name(preset: str, slot: int) -> str:
@@ -259,7 +304,7 @@ def preset_sex(preset: str) -> Sex | None:
     """
     if is_voice(preset):
         return voice(preset)["sex"]
-    return {"f": "female", "m": "male"}.get(preset[1:2])
+    return SEX_BY_LETTER.get(preset[1:2])
 
 
 async def workspace_root(ctx: Context) -> str | None:

@@ -62,6 +62,56 @@ def test_announce(label, prefix, expected):
     assert identity.announce(label, "Done.", prefix) == expected
 
 
+# --- voice allocation, without a filesystem ------------------------------
+
+
+def test_next_voice_takes_the_best_unused_one():
+    assert identity.next_voice({}) == identity.VOICE_IDS[0]
+    assert identity.next_voice({"/a": identity.VOICE_IDS[0]}) == identity.VOICE_IDS[1]
+
+
+def test_next_voice_wraps_deterministically_once_the_pool_is_spent():
+    full = {f"/root{i}": preset for i, preset in enumerate(identity.VOICE_IDS)}
+    assert identity.next_voice(full) == identity.VOICE_IDS[0]
+    assert identity.next_voice(full) == identity.next_voice(full)
+
+
+# --- slot arithmetic, without a lock or a clock ---------------------------
+
+
+def test_lowest_free_fills_the_gap():
+    seen = {("/a", "s1"): (1, 0.0), ("/a", "s3"): (3, 0.0)}
+    assert identity.lowest_free(seen, "/a") == 2
+    assert identity.lowest_free(seen, "/other") == 1
+
+
+def test_unexpired_keeps_only_recent_sessions():
+    seen = {("/a", "fresh"): (1, 100.0), ("/a", "stale"): (2, 0.0)}
+    assert identity.unexpired(seen, now=110.0, ttl=30.0) == {
+        ("/a", "fresh"): (1, 100.0)
+    }
+
+
+def test_assign_slot_is_pure_in_its_argument():
+    seen = {}
+    after, slot = identity.assign_slot(seen, "/a", "s1", now=0.0, ttl=30.0)
+    assert slot == 1
+    assert seen == {}, "the caller's table must not be mutated"
+    assert after == {("/a", "s1"): (1, 0.0)}
+
+
+def test_assign_slot_is_idempotent_for_one_session():
+    first, one = identity.assign_slot({}, "/a", "s1", now=0.0, ttl=30.0)
+    _, again = identity.assign_slot(first, "/a", "s1", now=1.0, ttl=30.0)
+    assert one == again == 1
+
+
+def test_assign_slot_reclaims_an_expired_number():
+    stale, _ = identity.assign_slot({}, "/a", "s1", now=0.0, ttl=30.0)
+    _, slot = identity.assign_slot(stale, "/a", "s2", now=100.0, ttl=30.0)
+    assert slot == 1
+
+
 # --- voice registry ------------------------------------------------------
 
 
@@ -122,6 +172,28 @@ def test_a_freed_slot_is_reused_at_the_lowest_number():
         slots.slot("/a", session)
     slots._seen.pop(("/a", "s2"))
     assert slots.slot("/a", "s4") == 2
+
+
+# --- label and key rules -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("root", "expected"),
+    [("/projects/spade", "spade"), ("/", "workspace"), ("", "workspace")],
+)
+def test_workspace_name(root, expected):
+    assert identity.workspace_name(root) == expected
+
+
+def test_voice_key_keeps_slot_one_on_the_bare_root():
+    """The key shape is persisted in assignments.json, so it is load-bearing."""
+    assert identity.voice_key("/projects/cfd", 1) == "/projects/cfd"
+    assert identity.voice_key("/projects/cfd", 3) == "/projects/cfd#3"
+
+
+def test_workspace_label_names_only_later_slots():
+    assert identity.workspace_label("cfd", 1, "af_heart") == "cfd"
+    assert identity.workspace_label("cfd", 2, "af_heart").startswith("cfd ")
 
 
 # --- speaker -------------------------------------------------------------
