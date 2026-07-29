@@ -30,6 +30,6 @@ def context():
 def voices_dir(tmp_path, monkeypatch):
     """A clip on disk for every pooled voice."""
     monkeypatch.setattr(identity, "VOICES_DIR", tmp_path)
-    for voice in identity.VOICE_POOL:
-        (tmp_path / f"{voice}.wav").touch()
+    for preset in identity.VOICE_IDS:
+        (tmp_path / f"{preset}.wav").touch()
     return tmp_path

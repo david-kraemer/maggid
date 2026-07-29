@@ -6,8 +6,8 @@ Apple Silicon through [MLX-audio](https://github.com/Blaizzy/mlx-audio). Claude
 speaks its notifications and narration aloud, with a distinct voice per workspace
 when several agents run at once.
 
-A *maggid* is an itinerant preacher — one who tells, as against one who rules on
-the law. Fitting for a server whose only job is to say what happened.
+A *maggid* is an itinerant preacher — one who tells, as against one who
+expounds. Fitting for a server whose only job is to say what happened.
 
 **Requirements:** macOS on Apple Silicon, Python 3.12 or later.
 

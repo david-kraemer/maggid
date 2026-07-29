@@ -10,6 +10,8 @@ import mlx.core as mx
 from mlx.nn.layers import Module
 from mlx_audio.tts.utils import load_model as mlx_load_model
 
+from .paths import StrPath, resolve_path
+
 logger = logging.getLogger(__name__)
 
 # Chatterbox Turbo, 8-bit. Measured on an M5 Max: 190 ms for a short phrase,
@@ -37,7 +39,7 @@ _synthesis = concurrent.futures.ThreadPoolExecutor(
 )
 
 
-async def synthesize(text: str, ref_audio: str | None = None) -> mx.array:
+async def synthesize(text: str, ref_audio: StrPath | None = None) -> mx.array:
     """Run inference off the event loop, serialized against other callers."""
     return await asyncio.get_running_loop().run_in_executor(
         _synthesis, functools.partial(generate, text, ref_audio=ref_audio)
@@ -57,7 +59,7 @@ async def preload() -> None:
     logger.info("Warmup finished in %.1fs.", time.monotonic() - start)
 
 
-def generate(text: str, ref_audio: str | None = None) -> mx.array:
+def generate(text: str, ref_audio: StrPath | None = None) -> mx.array:
     """Raw audio for the text.
 
     Runs in the synthesis thread, so the lazy MLX graph is forced here.
@@ -91,14 +93,15 @@ def load_model(path: str = HUGGINGFACE_REPO) -> Module:
 
 
 @functools.lru_cache
-def conditionals(ref_audio: str):
-    """The encoded reference clip. Encoded once per clip and kept.
+def conditionals(ref_audio: StrPath):
+    """The encoded reference clip. Encoded once per clip, then kept.
 
-    Passing ref_audio to generate() re-encodes the clip every call: 950 ms per
-    utterance instead of 190 ms. Encoding once per voice and swapping the model's
-    slot gets that back. This is safe because all synthesis is serialized on one
-    thread, so no two callers touch the slot at once.
+    A ref_audio argument to generate() re-encodes the clip on every call: 950 ms per
+    utterance instead of 190 ms. One encode per voice, then a swap of the model's
+    slot, recovers that. This is safe because one thread does all synthesis, so two
+    callers never touch the slot at once.
     """
     model = load_model()
-    model.prepare_conditionals(ref_audio)
+    # mlx-audio needs a str, so the Path stops here.
+    model.prepare_conditionals(str(resolve_path(ref_audio)))
     return model._conds

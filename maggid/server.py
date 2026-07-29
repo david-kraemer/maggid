@@ -11,15 +11,11 @@ from contextlib import asynccontextmanager
 from fastmcp import Context, FastMCP
 from rich.logging import RichHandler
 
-from maggid import identity, synth
-from maggid.config import (
-    Config,
-    channel_priority,
-    load_config,
-    validate_ref_audio,
-    write_default_config,
-)
-from maggid.playback import SAMPLE_RATE, SPEED, PlaybackQueue
+from . import identity, synth
+from .config import Config, validate_ref_audio
+from .playback import SAMPLE_RATE, SPEED, PlaybackQueue
+
+__all__ = ["init", "main"]
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +37,6 @@ class Runtime:
     slots: identity.SessionSlots
 
 
-@dataclasses.dataclass(frozen=True)
-class Spoken:
-    """What was said, and whether it reached the queue."""
-
-    label: str
-    voice: str
-    seconds: float
-    queued: bool
-
-
 _runtime: Runtime | None = None
 _warm_at_start = False
 
@@ -62,7 +48,7 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[dict]:
     playback = PlaybackQueue()
     playback.start()
     _runtime = Runtime(
-        config=load_config(),
+        config=Config.read(),
         playback=playback,
         voices=identity.VoiceRegistry(),
         slots=identity.SessionSlots(),
@@ -122,37 +108,6 @@ async def interrupt() -> str:
     return f"Interrupted playback, discarded {dropped} queued item(s)."
 
 
-async def _say(
-    text: str, ctx: Context, channel: str | None, ref_audio: str | None = None
-) -> Spoken:
-    """Synthesize one utterance and queue it. Shared by notify and speak."""
-    runtime = _live()
-    priority = channel_priority(runtime.config, channel)
-    if ref_audio is not None:
-        validate_ref_audio(ref_audio)
-        clip, label = ref_audio, ""
-    else:
-        clip, label = await identity.speaker(
-            ctx, runtime.config, runtime.voices, runtime.slots
-        )
-    audio = await synth.synthesize(
-        identity.announce(label, text, runtime.config.prefix), ref_audio=clip
-    )
-    return Spoken(
-        label=label,
-        voice=label or (pathlib.PurePath(clip).stem if clip else "built-in"),
-        seconds=len(audio) / SAMPLE_RATE / SPEED,
-        queued=runtime.playback.enqueue(audio, priority),
-    )
-
-
-def _live() -> Runtime:
-    """The running server state, or a legible error."""
-    if _runtime is None:
-        raise RuntimeError("The server is starting or shutting down. Try again.")
-    return _runtime
-
-
 def main(argv: list[str] | None = None) -> None:
     """Run the server. Argument parsing lives here, so the console script sees it."""
     global _warm_at_start
@@ -180,9 +135,49 @@ def main(argv: list[str] | None = None) -> None:
 def init() -> None:
     """Pre-download the model and write a default config."""
     _configure_logging()
-    write_default_config()
+    Config.write_default()
     logger.info("Preloading the model for a faster first response ...")
     synth.load_model()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Spoken:
+    """What was said, and whether it reached the queue."""
+
+    label: str
+    voice: str
+    seconds: float
+    queued: bool
+
+
+async def _say(
+    text: str, ctx: Context, channel: str | None, ref_audio: str | None = None
+) -> Spoken:
+    """Synthesize one utterance and queue it. Shared by notify and speak."""
+    runtime = _live()
+    priority = runtime.config.priority(channel)
+    if ref_audio is not None:
+        clip, label = validate_ref_audio(pathlib.Path(ref_audio)), ""
+    else:
+        clip, label = await identity.speaker(
+            ctx, runtime.config, runtime.voices, runtime.slots
+        )
+    audio = await synth.synthesize(
+        identity.announce(label, text, runtime.config.prefix), ref_audio=clip
+    )
+    return Spoken(
+        label=label,
+        voice=label or (clip.stem if clip else "built-in"),
+        seconds=len(audio) / SAMPLE_RATE / SPEED,
+        queued=runtime.playback.enqueue(audio, priority),
+    )
+
+
+def _live() -> Runtime:
+    """The running server state, or a legible error."""
+    if _runtime is None:
+        raise RuntimeError("The server is starting or shutting down. Try again.")
+    return _runtime
 
 
 def _configure_logging() -> None:

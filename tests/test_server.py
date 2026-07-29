@@ -49,7 +49,7 @@ def test_an_unidentified_caller_reports_the_built_in_voice(runtime, context):
 
 
 def test_an_explicit_clip_names_the_clip(runtime, context, voices_dir, monkeypatch):
-    monkeypatch.setattr(server, "validate_ref_audio", lambda path: None)
+    monkeypatch.setattr(server, "validate_ref_audio", lambda path: path)
     clip = str(voices_dir / "am_puck.wav")
     spoken = asyncio.run(server._say("hi", context("/x/spade"), None, clip))
     assert spoken.voice == "am_puck"
