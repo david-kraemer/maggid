@@ -30,7 +30,7 @@ WRITE_CHUNK = 2048
 MAX_BACKLOG = 32
 
 
-@dataclasses.dataclass(frozen=True, order=True)
+@dataclasses.dataclass(frozen=True, order=True, slots=True)
 class PlaybackItem:
     """Priority queue entry. Lower priority plays first, as heapq expects."""
 

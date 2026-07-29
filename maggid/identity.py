@@ -152,7 +152,7 @@ class VoiceRegistry:
             logger.warning("Could not persist assignments to %s", self._path)
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class Session:
     """One client connection to one workspace root."""
 
@@ -160,7 +160,7 @@ class Session:
     id: str
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class Slot:
     """The number a session holds on its root, and when it last spoke."""
 
@@ -247,6 +247,17 @@ async def speaker(
     return clip, label
 
 
+def announce(label: str, text: str, prefix: bool = True) -> str:
+    """The text with the workspace label in front, so the listener knows who speaks.
+
+    Use a period, not a dash. The engine reads a period as a pause. It either omits a
+    dash or speaks it.
+    """
+    if not label or not prefix:
+        return text
+    return f"{label}. {text}"
+
+
 def workspace_name(root: str) -> str:
     """The last component of a workspace root."""
     return pathlib.PurePath(root).name or "workspace"
@@ -303,14 +314,3 @@ async def workspace_root(ctx: Context) -> str | None:
     if not uri.startswith("file://"):
         return uri or None
     return urllib.parse.unquote(urllib.parse.urlparse(uri).path) or None
-
-
-def announce(label: str, text: str, prefix: bool = True) -> str:
-    """The text with the workspace label in front, so the listener knows who speaks.
-
-    Use a period, not a dash. The engine reads a period as a pause. It either omits a
-    dash or speaks it.
-    """
-    if not label or not prefix:
-        return text
-    return f"{label}. {text}"

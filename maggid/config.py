@@ -18,30 +18,6 @@ CONFIG_FILE = CONFIG_DIR / "channels.toml"
 
 
 @dataclasses.dataclass(frozen=True)
-class Channel:
-    """A priority class for the shared queue."""
-
-    name: str
-    priority: int
-    purpose: str
-
-
-# Urgent speech goes ahead of narration that already waits. A lower number plays
-# first. DEFAULT_PRIORITIES and the generated config file both come from this table,
-# so a new channel is one new row.
-CHANNELS: list[Channel] = [
-    Channel("permission", 1, "Blocks until you answer."),
-    Channel("question", 2, "Answer whenever you like."),
-    Channel("notify", 10, "Stage transitions."),
-    Channel("narrate", 15, "Reasoning aloud."),
-]
-DEFAULT_PRIORITIES: Mapping[str, int] = {c.name: c.priority for c in CHANNELS}
-
-# A message with no channel gets this priority. A test asserts the row exists.
-FALLBACK_CHANNEL = "notify"
-
-
-@dataclasses.dataclass(frozen=True)
 class Config:
     """Everything the TOML file controls."""
 
@@ -105,6 +81,30 @@ class Config:
         path.write_text(CONFIG_TEMPLATE)
         logger.info("Wrote %s.", path)
         return True
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Channel:
+    """A priority class for the shared queue."""
+
+    name: str
+    priority: int
+    purpose: str
+
+
+# Urgent speech goes ahead of narration that already waits. A lower number plays
+# first. DEFAULT_PRIORITIES and the generated config file both come from this table,
+# so a new channel is one new row.
+CHANNELS: list[Channel] = [
+    Channel("permission", 1, "Blocks until you answer."),
+    Channel("question", 2, "Answer whenever you like."),
+    Channel("notify", 10, "Stage transitions."),
+    Channel("narrate", 15, "Reasoning aloud."),
+]
+DEFAULT_PRIORITIES: Mapping[str, int] = {c.name: c.priority for c in CHANNELS}
+
+# A message with no channel gets this priority. A test asserts the row exists.
+FALLBACK_CHANNEL = "notify"
 
 
 def usable_ref(path: StrPath | None) -> pathlib.Path | None:
