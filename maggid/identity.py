@@ -1,5 +1,6 @@
-"""Which workspace is speaking: a voice and a spoken label."""
+"""Which workspace speaks: a voice and a spoken label."""
 
+import dataclasses
 import itertools
 import json
 import logging
@@ -13,6 +14,7 @@ from typing import Literal, TypedDict
 from fastmcp import Context
 
 from .config import CONFIG_DIR, Config
+from .paths import StrPath, resolve_path, writable_path
 from .typing_ import guard_type
 
 logger = logging.getLogger(__name__)
@@ -35,22 +37,18 @@ class Name(TypedDict):
     sex: Sex
 
 
-# Kokoro encodes sex in the second character of a preset id: af_, am_, bf_, bm_.
+# Kokoro puts the sex in the second character of a preset id: af_, am_, bf_, bm_.
 SEX_BY_LETTER: Mapping[str, Sex] = {"f": "female", "m": "male"}
 
-
-# Rated every cloned candidate, kept the ones at 8 or better, then took the subset
-# with the largest minimum pairwise distance (speaker-embedding cosine). Best-rated
-# first, which is also assignment order, so the first workspace seen gets the best
-# voice.
+# Each candidate clone has a rating. These are the ones at 8 or better, in the subset
+# with the largest minimum pairwise distance (speaker-embedding cosine). The best
+# rating comes first, and assignment follows the same order.
 #
-# Nine is the practical ceiling. Even the best nine hold one pair at 0.86 cosine,
-# because Chatterbox pulls every clone toward its own character. Voice alone separates
-# four or five workspaces. The spoken label does the real work.
+# Nine voices is the practical limit. The best nine still hold one pair at 0.86
+# cosine, because Chatterbox moves every clone toward its own character. Voice alone
+# separates four or five workspaces. The label separates the rest.
 #
-# Kokoro ids encode the same sex and dialect in their first two characters. The table
-# is authoritative and a test asserts the two agree, so a typo here cannot quietly
-# hand a male voice a female name.
+# A test asserts that each row agrees with the sex its id encodes.
 _VOICES: list[Voice] = [
     {"id": "af_heart", "sex": "female", "dialect": "american"},
     {"id": "af_jessica", "sex": "female", "dialect": "american"},
@@ -68,9 +66,9 @@ is_voice = guard_type(voice)
 
 VOICE_IDS = list(VOICES.keys())
 
-# Concurrent sessions on one root get names, not numbers. "cfd Bonnie" and
-# "cfd Colin" are easier to tell apart than "cfd two" and "cfd three", which
-# differ only in an unstressed final syllable.
+# Concurrent sessions on one root get names, not numbers. "cfd Bonnie" and "cfd Colin"
+# are easier to tell apart than "cfd two" and "cfd three". The numbers differ only in
+# an unstressed final syllable.
 _NAMES: list[Name] = [
     {"name": "Bonnie", "sex": "female"},
     {"name": "Danielle", "sex": "female"},
@@ -94,30 +92,23 @@ _NAMES: list[Name] = [
     {"name": "Tobias", "sex": "male"},
 ]
 
-NAMES: Mapping[str, Name] = {n["name"]: n for n in _NAMES}
-name: Callable[[str], Name] = NAMES.__getitem__
-is_name = guard_type(name)
-
-# Names by sex, in table order, so a voice can draw one that agrees with it. Derived
-# from _NAMES rather than kept alongside it: two lists to edit is one list too many.
+# Names by sex, in table order. A voice draws a name that agrees with it. These lists
+# derive from _NAMES, so there is one list to edit.
 NAMES_BY_SEX: Mapping[Sex, tuple[str, ...]] = {
     sex: tuple(n["name"] for n in _NAMES if n["sex"] == sex)
     for sex in {n["sex"] for n in _NAMES}
 }
 
-
-# A slot is free once its session goes quiet this long. Sessions do not announce
-# that they close, and a reconnect arrives under a fresh id, so expiry is the
-# only signal.
+# A slot is free when its session is quiet for this long. Sessions do not report that
+# they close, and a reconnect arrives under a new id, so expiry is the only signal.
 SESSION_TTL = 1800.0
 
 
 def _names_for_pool() -> Mapping[str, str]:
-    """One sex-matched name per pooled voice.
+    """One name per pooled voice, matched by sex.
 
-    A name drawn from the voice's own row can never disagree with it, and distinct
-    voices give distinct names at no cost. The zip truncates on purpose, so a lopsided
-    pool loses a name and falls back to the slot number instead of failing.
+    The zip truncates on purpose. A lopsided pool loses a name and falls back to the
+    slot number.
     """
     return {
         v["id"]: spoken
@@ -132,10 +123,10 @@ VOICE_NAMES = _names_for_pool()
 
 
 def next_voice(assigned: Mapping[str, str]) -> str:
-    """An unused voice, or a wrapped one once the pool runs out.
+    """An unused voice. Wraps to a used one when the pool is empty.
 
-    Past nine workspaces two roots share a voice, and only the spoken label tells
-    them apart. The wrap is deterministic, so it is at least stable.
+    Past nine workspaces, two roots share a voice and only the label separates them.
+    The wrap is deterministic, so it stays stable.
     """
     used = set(assigned.values())
     free = [v for v in VOICE_IDS if v not in used]
@@ -143,25 +134,24 @@ def next_voice(assigned: Mapping[str, str]) -> str:
 
 
 class VoiceRegistry:
-    """Assigns a stable voice per workspace. Survives a daemon restart.
+    """A stable voice per workspace. Survives a daemon restart.
 
-    Keyed on the workspace root, not the MCP session id. A session id rotates
-    whenever the client reconnects, which would reshuffle every voice the first
-    time the daemon bounced.
+    The key is the workspace root, not the MCP session id. A session id changes on
+    each reconnect, which would reshuffle every voice when the daemon restarts.
     """
 
-    def __init__(self, path: pathlib.Path = ASSIGNMENTS) -> None:
-        self._path = path
+    def __init__(self, path: StrPath = ASSIGNMENTS) -> None:
+        self._path = resolve_path(path)
         self._map: dict[str, str] = {}
         try:
-            self._map = json.loads(path.read_text())
+            self._map = json.loads(self._path.read_text())
         except FileNotFoundError:
             pass
         except (OSError, ValueError):
-            logger.warning("Could not read %s. Starting fresh.", path)
+            logger.warning("Could not read %s. Starting fresh.", self._path)
 
     def voice(self, root: str) -> str:
-        """Preset for this workspace. Allocates one on first sight."""
+        """The preset for this workspace. Assigns one on first sight."""
         if root not in self._map:
             self._map[root] = next_voice(self._map)
             logger.info("Assigned voice %s to %s", self._map[root], root)
@@ -170,84 +160,97 @@ class VoiceRegistry:
 
     def _save(self) -> None:
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(self._map, indent=2, sort_keys=True))
+            writable_path(self._path).write_text(
+                json.dumps(self._map, indent=2, sort_keys=True)
+            )
         except OSError:
             logger.warning("Could not persist assignments to %s", self._path)
 
 
-# Slot table: which numbered session holds a root, and when it last spoke.
-type Seen = Mapping[tuple[str, str], tuple[int, float]]
+@dataclasses.dataclass(frozen=True)
+class Session:
+    """One client connection to one workspace root."""
+
+    root: str
+    id: str
 
 
-def unexpired(seen: Seen, now: float, ttl: float) -> Seen:
-    """The table without slots whose session has gone quiet."""
-    return {key: value for key, value in seen.items() if now - value[1] <= ttl}
+@dataclasses.dataclass(frozen=True)
+class Slot:
+    """The number a session holds on its root, and when it last spoke."""
+
+    number: int
+    at: float
 
 
-def lowest_free(seen: Seen, root: str) -> int:
-    """Lowest slot number unused on the root. Starts at 1."""
-    taken = {slot for (r, _), (slot, _) in seen.items() if r == root}
+type Slots = Mapping[Session, Slot]
+
+
+def unexpired(slots: Slots, now: float, ttl: float) -> Slots:
+    """The table without the sessions that are quiet."""
+    return {session: slot for session, slot in slots.items() if now - slot.at <= ttl}
+
+
+def lowest_free(slots: Slots, root: str) -> int:
+    """The lowest number the root does not use. Starts at 1."""
+    taken = {slot.number for session, slot in slots.items() if session.root == root}
     return next(i for i in itertools.count(1) if i not in taken)
 
 
 def assign_slot(
-    seen: Seen, root: str, session_id: str, now: float, ttl: float
-) -> tuple[Seen, int]:
-    """The slot this session holds, and the table it leaves behind.
+    slots: Slots, session: Session, now: float, ttl: float
+) -> tuple[Slots, int]:
+    """The number this session holds, and the table that results.
 
-    Pure, so the caller owns both the clock and the state. Expiry happens here
-    rather than on a timer because sessions do not announce that they close, and a
-    reconnect arrives under a fresh id.
+    The function is pure. The caller owns the clock and the table.
 
-    :returns: (table including this session's slot; the slot number)
+    :returns: (the table with this session included; the number)
     """
-    live = unexpired(seen, now, ttl)
-    key = (root, session_id)
-    slot = live[key][0] if key in live else lowest_free(live, root)
-    return {**live, key: (slot, now)}, slot
+    live = unexpired(slots, now, ttl)
+    number = (
+        live[session].number if session in live else lowest_free(live, session.root)
+    )
+    return {**live, session: Slot(number, now)}, number
 
 
 class SessionSlots:
-    """Separates concurrent sessions that share one workspace root.
+    """Separates concurrent sessions on one workspace root.
 
-    Several terminals on one directory is the normal case, not an edge case.
-    Without slots they share a voice and a label, which defeats the purpose.
-
-    A lock and a clock around assign_slot. All the reasoning lives there.
+    Several terminals on one directory is normal. Without slots they share a voice and
+    a label. This class is a lock and a clock around assign_slot.
     """
 
     def __init__(self, ttl: float = SESSION_TTL) -> None:
         self._ttl = ttl
-        self._seen: Seen = {}
+        self._slots: Slots = {}
         self._lock = threading.Lock()
 
     def slot(self, root: str, session_id: str | None) -> int:
-        """Which concurrent session this is for the root. Starts at 1."""
+        """The number of this concurrent session on the root. Starts at 1."""
         if session_id is None:
             return 1
         with self._lock:
-            self._seen, slot = assign_slot(
-                self._seen, root, session_id, time.monotonic(), self._ttl
+            self._slots, number = assign_slot(
+                self._slots, Session(root, session_id), time.monotonic(), self._ttl
             )
-            return slot
+            return number
 
 
 async def speaker(
     ctx: Context, config: Config, voices: VoiceRegistry, slots: SessionSlots
 ) -> tuple[pathlib.Path | None, str]:
-    """Voice clip and spoken label for the calling session.
+    """The voice clip and spoken label for the calling session.
 
-    :returns: (clip path, or None for the built-in voice; label, or "" when the
-        workspace is unidentifiable)
+    :returns: (the clip path, or None for the built-in voice; the label, or "" when
+        the workspace has no identity)
     """
     root = await workspace_root(ctx)
     if root is None:
         return config.ref_audio, ""
     slot = slots.slot(root, ctx.session_id)
     name = workspace_name(root)
-    # Voices are per slot, so the second terminal on a root sounds different from
-    # the first. A [voices] pin applies to the first slot only.
+    # Voices are per slot, so the second terminal on a root sounds different from the
+    # first. A [voices] pin applies to the first slot only.
     pinned = config.voices.get(name) if slot == 1 else None
     preset = pinned or voices.voice(voice_key(root, slot))
     # The label comes after the voice, because the name must match the voice sex.
@@ -260,33 +263,33 @@ async def speaker(
 
 
 def workspace_name(root: str) -> str:
-    """Spoken stem of a workspace root."""
+    """The last component of a workspace root."""
     return pathlib.PurePath(root).name or "workspace"
 
 
 def voice_key(root: str, slot: int) -> str:
-    """Registry key for a session. Slot 1 owns the root; later slots hang off it.
+    """The registry key for a session. Slot 1 uses the bare root.
 
-    This shape reaches assignments.json, so changing it orphans every voice a user
-    has already been given.
+    assignments.json holds this shape. A change to it orphans every voice already
+    assigned.
     """
     return root if slot == 1 else f"{root}#{slot}"
 
 
 def workspace_label(name: str, slot: int, preset: str) -> str:
-    """What the listener hears before the message.
+    """The label the listener hears before the message.
 
-    Slot 1 keeps the bare workspace name, so a lone session is never called "spade
-    Colin", and no session is renamed once a second one appears.
+    Slot 1 keeps the bare workspace name. A lone session is never "spade Colin", and
+    no session gets a new label when a second one starts.
     """
     return name if slot == 1 else f"{name} {session_name(preset, slot)}"
 
 
 def session_name(preset: str, slot: int) -> str:
-    """Spoken name for a session, matching the sex of its voice.
+    """A name for a session that matches the sex of its voice.
 
-    Falls back to the slot number for a preset whose sex cannot be established, such
-    as a [voices] pin outside the pool. A mismatched name is worse than a number.
+    Falls back to the slot number when the sex is unknown, such as a [voices] pin
+    outside the pool. A wrong name is worse than a number.
     """
     if preset in VOICE_NAMES:
         return VOICE_NAMES[preset]
@@ -297,10 +300,9 @@ def session_name(preset: str, slot: int) -> str:
 
 
 def preset_sex(preset: str) -> Sex | None:
-    """Sex of a Kokoro preset: from the table if pooled, else from the id.
+    """The sex of a Kokoro preset. Reads the table first, then the id.
 
-    Kokoro encodes sex in the second character — af_, am_, bf_, bm_ — which is the
-    only handle available for a [voices] pin the pool has never seen.
+    The id is the only handle for a [voices] pin outside the pool.
     """
     if is_voice(preset):
         return voice(preset)["sex"]
@@ -308,12 +310,16 @@ def preset_sex(preset: str) -> Sex | None:
 
 
 async def workspace_root(ctx: Context) -> str | None:
-    """Path the client advertises as its root, if it advertises one."""
+    """The path the client advertises as its root, if it advertises one.
+
+    This stays a str. It is an opaque key for VoiceRegistry, and assignments.json
+    holds the exact text the client sent. Path normalization would orphan it.
+    """
     try:
         roots = await ctx.list_roots()
     except Exception as e:  # noqa: BLE001 - identity is best-effort
-        # A client need not support roots. A transport fault here must cost the
-        # label, not the notification.
+        # A client need not support roots. A transport fault costs the label, not the
+        # notification.
         logger.debug("No workspace root available: %s", e)
         return None
     if not roots:
@@ -325,10 +331,10 @@ async def workspace_root(ctx: Context) -> str | None:
 
 
 def announce(label: str, text: str, prefix: bool = True) -> str:
-    """Text with the workspace label first, so the listener knows who talks.
+    """The text with the workspace label in front, so the listener knows who speaks.
 
-    A period, not a dash. The engine reads a period as a pause. It either
-    swallows a dash or speaks it.
+    Use a period, not a dash. The engine reads a period as a pause. It either omits a
+    dash or speaks it.
     """
     if not label or not prefix:
         return text

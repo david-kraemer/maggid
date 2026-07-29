@@ -9,6 +9,6 @@ MLX-audio. Provides `notify` for short alerts, `speak` for longer narration, and
 or as one shared daemon.
 """
 
-# Star import so server.__all__ stays the single list of what the package exports.
-# Ruff cannot verify names through a star, hence the suppression.
+# server.__all__ is the one list of package exports. Ruff cannot check names through a
+# star import, so the rule is off here.
 from .server import *  # noqa: F403

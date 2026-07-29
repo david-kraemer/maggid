@@ -80,36 +80,47 @@ def test_next_voice_wraps_deterministically_once_the_pool_is_spent():
 
 
 def test_lowest_free_fills_the_gap():
-    seen = {("/a", "s1"): (1, 0.0), ("/a", "s3"): (3, 0.0)}
-    assert identity.lowest_free(seen, "/a") == 2
-    assert identity.lowest_free(seen, "/other") == 1
+    slots = {
+        identity.Session("/a", "s1"): identity.Slot(1, 0.0),
+        identity.Session("/a", "s3"): identity.Slot(3, 0.0),
+    }
+    assert identity.lowest_free(slots, "/a") == 2
+    assert identity.lowest_free(slots, "/other") == 1
 
 
 def test_unexpired_keeps_only_recent_sessions():
-    seen = {("/a", "fresh"): (1, 100.0), ("/a", "stale"): (2, 0.0)}
-    assert identity.unexpired(seen, now=110.0, ttl=30.0) == {
-        ("/a", "fresh"): (1, 100.0)
+    fresh = identity.Session("/a", "fresh")
+    slots = {
+        fresh: identity.Slot(1, 100.0),
+        identity.Session("/a", "stale"): identity.Slot(2, 0.0),
+    }
+    assert identity.unexpired(slots, now=110.0, ttl=30.0) == {
+        fresh: identity.Slot(1, 100.0)
     }
 
 
 def test_assign_slot_is_pure_in_its_argument():
-    seen = {}
-    after, slot = identity.assign_slot(seen, "/a", "s1", now=0.0, ttl=30.0)
-    assert slot == 1
-    assert seen == {}, "the caller's table must not be mutated"
-    assert after == {("/a", "s1"): (1, 0.0)}
+    session = identity.Session("/a", "s1")
+    slots = {}
+    after, number = identity.assign_slot(slots, session, now=0.0, ttl=30.0)
+    assert number == 1
+    assert slots == {}, "the caller's table must not be mutated"
+    assert after == {session: identity.Slot(1, 0.0)}
 
 
 def test_assign_slot_is_idempotent_for_one_session():
-    first, one = identity.assign_slot({}, "/a", "s1", now=0.0, ttl=30.0)
-    _, again = identity.assign_slot(first, "/a", "s1", now=1.0, ttl=30.0)
+    session = identity.Session("/a", "s1")
+    first, one = identity.assign_slot({}, session, now=0.0, ttl=30.0)
+    _, again = identity.assign_slot(first, session, now=1.0, ttl=30.0)
     assert one == again == 1
 
 
 def test_assign_slot_reclaims_an_expired_number():
-    stale, _ = identity.assign_slot({}, "/a", "s1", now=0.0, ttl=30.0)
-    _, slot = identity.assign_slot(stale, "/a", "s2", now=100.0, ttl=30.0)
-    assert slot == 1
+    stale, _ = identity.assign_slot({}, identity.Session("/a", "s1"), now=0.0, ttl=30.0)
+    _, number = identity.assign_slot(
+        stale, identity.Session("/a", "s2"), now=100.0, ttl=30.0
+    )
+    assert number == 1
 
 
 # --- voice registry ------------------------------------------------------
@@ -170,7 +181,7 @@ def test_a_freed_slot_is_reused_at_the_lowest_number():
     slots = identity.SessionSlots()
     for session in ("s1", "s2", "s3"):
         slots.slot("/a", session)
-    slots._seen.pop(("/a", "s2"))
+    slots._slots.pop(identity.Session("/a", "s2"))
     assert slots.slot("/a", "s4") == 2
 
 
