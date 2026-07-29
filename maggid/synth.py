@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import functools
 import logging
+import pathlib
 import time
 
 import mlx.core as mx
@@ -37,7 +38,7 @@ _synthesis = concurrent.futures.ThreadPoolExecutor(
 )
 
 
-async def synthesize(text: str, ref_audio: str | None = None) -> mx.array:
+async def synthesize(text: str, ref_audio: pathlib.Path | None = None) -> mx.array:
     """Run inference off the event loop, serialized against other callers."""
     return await asyncio.get_running_loop().run_in_executor(
         _synthesis, functools.partial(generate, text, ref_audio=ref_audio)
@@ -57,7 +58,7 @@ async def preload() -> None:
     logger.info("Warmup finished in %.1fs.", time.monotonic() - start)
 
 
-def generate(text: str, ref_audio: str | None = None) -> mx.array:
+def generate(text: str, ref_audio: pathlib.Path | None = None) -> mx.array:
     """Raw audio for the text.
 
     Runs in the synthesis thread, so the lazy MLX graph is forced here.
@@ -91,7 +92,7 @@ def load_model(path: str = HUGGINGFACE_REPO) -> Module:
 
 
 @functools.lru_cache
-def conditionals(ref_audio: str):
+def conditionals(ref_audio: pathlib.Path):
     """The encoded reference clip. Encoded once per clip and kept.
 
     Passing ref_audio to generate() re-encodes the clip every call: 950 ms per
@@ -100,5 +101,6 @@ def conditionals(ref_audio: str):
     thread, so no two callers touch the slot at once.
     """
     model = load_model()
-    model.prepare_conditionals(ref_audio)
+    # mlx-audio wants a str here, so the Path stops at the boundary.
+    model.prepare_conditionals(str(ref_audio))
     return model._conds

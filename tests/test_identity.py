@@ -1,6 +1,7 @@
 """Tests for voice assignment, session slots, and spoken labels."""
 
 import asyncio
+import pathlib
 
 import pytest
 
@@ -10,31 +11,40 @@ from maggid.config import Config
 # --- names ---------------------------------------------------------------
 
 
+def test_the_voice_table_agrees_with_the_kokoro_ids():
+    """Regression: a hand-edited row gave am_puck a female name."""
+    encoded = {"f": "female", "m": "male"}
+    for preset in identity.VOICE_IDS:
+        assert identity.voice(preset)["sex"] == encoded[preset[1]]
+
+
 def test_every_pooled_voice_has_a_distinct_name():
     names = identity.VOICE_NAMES
-    assert set(names) == set(identity.VOICE_POOL)
-    assert len(set(names.values())) == len(identity.VOICE_POOL)
+    assert set(names) == set(identity.VOICE_IDS)
+    assert len(set(names.values())) == len(identity.VOICE_IDS)
 
 
-def test_names_match_voice_gender():
-    for voice, name in identity.VOICE_NAMES.items():
-        pool = identity.FEMALE_NAMES if voice[1] == "f" else identity.MALE_NAMES
-        assert name in pool
+def test_names_match_voice_sex():
+    for preset, spoken in identity.VOICE_NAMES.items():
+        assert spoken in identity.NAMES_BY_SEX[identity.voice(preset)["sex"]]
 
 
 def test_a_lopsided_pool_loses_a_name_instead_of_failing(monkeypatch):
     """Regression: two exhausted iterators used to raise StopIteration at import."""
-    monkeypatch.setattr(identity, "VOICE_POOL", tuple(f"af_{i}" for i in range(99)))
-    assert len(identity._names_for_pool()) == len(identity.FEMALE_NAMES)
+    lopsided = [
+        {"id": f"af_{i}", "sex": "female", "dialect": "american"} for i in range(99)
+    ]
+    monkeypatch.setattr(identity, "_VOICES", lopsided)
+    assert len(identity._names_for_pool()) == len(identity.NAMES_BY_SEX["female"])
 
 
 def test_session_name_falls_back_to_the_slot_number():
     assert identity.session_name("custom", 3) == "3"
 
 
-def test_session_name_uses_gender_for_an_unpooled_preset():
-    assert identity.session_name("bm_unknown", 1) == identity.MALE_NAMES[1]
-    assert identity.session_name("bf_unknown", 1) == identity.FEMALE_NAMES[1]
+def test_session_name_uses_sex_for_an_unpooled_preset():
+    assert identity.session_name("bm_unknown", 1) == identity.NAMES_BY_SEX["male"][1]
+    assert identity.session_name("bf_unknown", 1) == identity.NAMES_BY_SEX["female"][1]
 
 
 # --- announce ------------------------------------------------------------
@@ -65,15 +75,15 @@ def test_voices_are_stable_and_persist(tmp_path):
 
 def test_the_pool_is_exhausted_before_it_wraps(tmp_path):
     registry = identity.VoiceRegistry(tmp_path / "assignments.json")
-    assigned = [registry.voice(f"/root{i}") for i in range(len(identity.VOICE_POOL))]
-    assert set(assigned) == set(identity.VOICE_POOL)
-    assert registry.voice("/one-too-many") in identity.VOICE_POOL
+    assigned = [registry.voice(f"/root{i}") for i in range(len(identity.VOICE_IDS))]
+    assert set(assigned) == set(identity.VOICE_IDS)
+    assert registry.voice("/one-too-many") in identity.VOICE_IDS
 
 
 def test_unreadable_assignments_start_fresh(tmp_path):
     path = tmp_path / "assignments.json"
     path.write_text("not json")
-    assert identity.VoiceRegistry(path).voice("/a") == identity.VOICE_POOL[0]
+    assert identity.VoiceRegistry(path).voice("/a") == identity.VOICE_IDS[0]
 
 
 # --- session slots -------------------------------------------------------
@@ -121,12 +131,12 @@ def test_no_root_gives_no_label(context):
     clip, label = asyncio.run(
         identity.speaker(
             context(None),
-            Config(ref_audio="/fallback.wav"),
+            Config(ref_audio=pathlib.Path("/fallback.wav")),
             identity.VoiceRegistry(),
             identity.SessionSlots(),
         )
     )
-    assert (clip, label) == ("/fallback.wav", "")
+    assert (clip, label) == (pathlib.Path("/fallback.wav"), "")
 
 
 def test_slot_one_keeps_the_bare_workspace_name(context, voices_dir):
@@ -139,7 +149,7 @@ def test_slot_one_keeps_the_bare_workspace_name(context, voices_dir):
         )
     )
     assert label == "spade"
-    assert clip == str(voices_dir / f"{identity.VOICE_POOL[0]}.wav")
+    assert clip == voices_dir / f"{identity.VOICE_IDS[0]}.wav"
 
 
 def test_a_second_session_is_named_and_sounds_different(context, voices_dir):
@@ -163,7 +173,7 @@ def test_a_pinned_voice_applies_to_the_first_slot_only(context, voices_dir):
     clip, _ = asyncio.run(
         identity.speaker(context("/projects/spade", "s1"), config, registry, slots)
     )
-    assert clip == str(voices_dir / "bm_daniel.wav")
+    assert clip == voices_dir / "bm_daniel.wav"
     other, _ = asyncio.run(
         identity.speaker(context("/projects/spade", "s2"), config, registry, slots)
     )

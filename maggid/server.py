@@ -11,15 +11,11 @@ from contextlib import asynccontextmanager
 from fastmcp import Context, FastMCP
 from rich.logging import RichHandler
 
-from maggid import identity, synth
-from maggid.config import (
-    Config,
-    channel_priority,
-    load_config,
-    validate_ref_audio,
-    write_default_config,
-)
-from maggid.playback import SAMPLE_RATE, SPEED, PlaybackQueue
+from . import identity, synth
+from .config import Config, validate_ref_audio
+from .playback import SAMPLE_RATE, SPEED, PlaybackQueue
+
+__all__ = ["init", "main"]
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +58,7 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[dict]:
     playback = PlaybackQueue()
     playback.start()
     _runtime = Runtime(
-        config=load_config(),
+        config=Config.read(),
         playback=playback,
         voices=identity.VoiceRegistry(),
         slots=identity.SessionSlots(),
@@ -127,10 +123,9 @@ async def _say(
 ) -> Spoken:
     """Synthesize one utterance and queue it. Shared by notify and speak."""
     runtime = _live()
-    priority = channel_priority(runtime.config, channel)
+    priority = runtime.config.priority(channel)
     if ref_audio is not None:
-        validate_ref_audio(ref_audio)
-        clip, label = ref_audio, ""
+        clip, label = validate_ref_audio(pathlib.Path(ref_audio)), ""
     else:
         clip, label = await identity.speaker(
             ctx, runtime.config, runtime.voices, runtime.slots
@@ -140,7 +135,7 @@ async def _say(
     )
     return Spoken(
         label=label,
-        voice=label or (pathlib.PurePath(clip).stem if clip else "built-in"),
+        voice=label or (clip.stem if clip else "built-in"),
         seconds=len(audio) / SAMPLE_RATE / SPEED,
         queued=runtime.playback.enqueue(audio, priority),
     )
@@ -180,7 +175,7 @@ def main(argv: list[str] | None = None) -> None:
 def init() -> None:
     """Pre-download the model and write a default config."""
     _configure_logging()
-    write_default_config()
+    Config.write_default()
     logger.info("Preloading the model for a faster first response ...")
     synth.load_model()
 
