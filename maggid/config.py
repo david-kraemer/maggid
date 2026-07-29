@@ -5,7 +5,7 @@ import logging
 import pathlib
 import tomllib
 from collections.abc import Mapping
-from typing import Self, TypedDict
+from typing import Self
 
 import soundfile
 
@@ -17,22 +17,25 @@ CONFIG_DIR = pathlib.Path.home() / ".config" / "maggid"
 CONFIG_FILE = CONFIG_DIR / "channels.toml"
 
 
-class Channel(TypedDict):
+@dataclasses.dataclass(frozen=True)
+class Channel:
+    """A priority class for the shared queue."""
+
     name: str
     priority: int
     purpose: str
 
 
-# Priority classes for the shared queue. Urgent speech goes ahead of narration that
-# already waits. A lower number plays first. DEFAULT_PRIORITIES and the generated
-# config file both come from this table, so a new channel is one new row.
+# Urgent speech goes ahead of narration that already waits. A lower number plays
+# first. DEFAULT_PRIORITIES and the generated config file both come from this table,
+# so a new channel is one new row.
 CHANNELS: list[Channel] = [
-    {"name": "permission", "priority": 1, "purpose": "Blocks until you answer."},
-    {"name": "question", "priority": 2, "purpose": "Answer whenever you like."},
-    {"name": "notify", "priority": 10, "purpose": "Stage transitions."},
-    {"name": "narrate", "priority": 15, "purpose": "Reasoning aloud."},
+    Channel("permission", 1, "Blocks until you answer."),
+    Channel("question", 2, "Answer whenever you like."),
+    Channel("notify", 10, "Stage transitions."),
+    Channel("narrate", 15, "Reasoning aloud."),
 ]
-DEFAULT_PRIORITIES: Mapping[str, int] = {c["name"]: c["priority"] for c in CHANNELS}
+DEFAULT_PRIORITIES: Mapping[str, int] = {c.name: c.priority for c in CHANNELS}
 
 # A message with no channel gets this priority. A test asserts the row exists.
 FALLBACK_CHANNEL = "notify"
@@ -157,7 +160,6 @@ CONFIG_TEMPLATE = (
     _CONFIG_PREAMBLE
     + "\n"
     + "\n".join(
-        f"# {c['purpose']}\n[{c['name']}]\npriority = {c['priority']}\n"
-        for c in CHANNELS
+        f"# {c.purpose}\n[{c.name}]\npriority = {c.priority}\n" for c in CHANNELS
     )
 )

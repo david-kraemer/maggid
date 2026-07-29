@@ -8,14 +8,13 @@ import pathlib
 import threading
 import time
 import urllib.parse
-from collections.abc import Callable, Mapping
-from typing import Literal, TypedDict
+from collections.abc import Mapping
+from typing import Literal
 
 from fastmcp import Context
 
 from .config import CONFIG_DIR, Config
 from .paths import StrPath, resolve_path, writable_path
-from .typing_ import guard_type
 
 logger = logging.getLogger(__name__)
 
@@ -23,22 +22,18 @@ VOICES_DIR = CONFIG_DIR / "voices" / "refs"
 ASSIGNMENTS = CONFIG_DIR / "assignments.json"
 
 type Sex = Literal["male", "female"]
-type Dialect = Literal["american", "british"]
-
-
-class Voice(TypedDict):
-    id: str
-    sex: Sex
-    dialect: Dialect
-
-
-class Name(TypedDict):
-    name: str
-    sex: Sex
-
 
 # Kokoro puts the sex in the second character of a preset id: af_, am_, bf_, bm_.
 SEX_BY_LETTER: Mapping[str, Sex] = {"f": "female", "m": "male"}
+
+
+def preset_sex(preset: str) -> Sex | None:
+    """The sex a Kokoro preset id encodes. None if the id does not follow it.
+
+    This is the only place that reads the convention.
+    """
+    return SEX_BY_LETTER.get(preset[1:2])
+
 
 # Each candidate clone has a rating. These are the ones at 8 or better, in the subset
 # with the largest minimum pairwise distance (speaker-embedding cosine). The best
@@ -47,56 +42,46 @@ SEX_BY_LETTER: Mapping[str, Sex] = {"f": "female", "m": "male"}
 # Nine voices is the practical limit. The best nine still hold one pair at 0.86
 # cosine, because Chatterbox moves every clone toward its own character. Voice alone
 # separates four or five workspaces. The label separates the rest.
-#
-# A test asserts that each row agrees with the sex its id encodes.
-_VOICES: list[Voice] = [
-    {"id": "af_heart", "sex": "female", "dialect": "american"},
-    {"id": "af_jessica", "sex": "female", "dialect": "american"},
-    {"id": "af_sarah", "sex": "female", "dialect": "american"},
-    {"id": "am_liam", "sex": "male", "dialect": "american"},
-    {"id": "bf_isabella", "sex": "female", "dialect": "british"},
-    {"id": "am_fenrir", "sex": "male", "dialect": "american"},
-    {"id": "am_puck", "sex": "male", "dialect": "american"},
-    {"id": "bf_alice", "sex": "female", "dialect": "british"},
-    {"id": "bm_daniel", "sex": "male", "dialect": "british"},
-]
-VOICES: Mapping[str, Voice] = {v["id"]: v for v in _VOICES}
-voice: Callable[[str], Voice] = VOICES.__getitem__
-is_voice = guard_type(voice)
-
-VOICE_IDS = list(VOICES.keys())
+VOICE_IDS: tuple[str, ...] = (
+    "af_heart",
+    "af_jessica",
+    "af_sarah",
+    "am_liam",
+    "bf_isabella",
+    "am_fenrir",
+    "am_puck",
+    "bf_alice",
+    "bm_daniel",
+)
 
 # Concurrent sessions on one root get names, not numbers. "cfd Bonnie" and "cfd Colin"
 # are easier to tell apart than "cfd two" and "cfd three". The numbers differ only in
 # an unstressed final syllable.
-_NAMES: list[Name] = [
-    {"name": "Bonnie", "sex": "female"},
-    {"name": "Danielle", "sex": "female"},
-    {"name": "Julia", "sex": "female"},
-    {"name": "Lisa", "sex": "female"},
-    {"name": "Nicole", "sex": "female"},
-    {"name": "Paula", "sex": "female"},
-    {"name": "Farrah", "sex": "female"},
-    {"name": "Hermine", "sex": "female"},
-    {"name": "Shary", "sex": "female"},
-    {"name": "Virginie", "sex": "female"},
-    {"name": "Colin", "sex": "male"},
-    {"name": "Earl", "sex": "male"},
-    {"name": "Martin", "sex": "male"},
-    {"name": "Owen", "sex": "male"},
-    {"name": "Richard", "sex": "male"},
-    {"name": "Karl", "sex": "male"},
-    {"name": "Walter", "sex": "male"},
-    {"name": "Gaston", "sex": "male"},
-    {"name": "Idris", "sex": "male"},
-    {"name": "Tobias", "sex": "male"},
-]
-
-# Names by sex, in table order. A voice draws a name that agrees with it. These lists
-# derive from _NAMES, so there is one list to edit.
 NAMES_BY_SEX: Mapping[Sex, tuple[str, ...]] = {
-    sex: tuple(n["name"] for n in _NAMES if n["sex"] == sex)
-    for sex in {n["sex"] for n in _NAMES}
+    "female": (
+        "Bonnie",
+        "Danielle",
+        "Julia",
+        "Lisa",
+        "Nicole",
+        "Paula",
+        "Farrah",
+        "Hermine",
+        "Shary",
+        "Virginie",
+    ),
+    "male": (
+        "Colin",
+        "Earl",
+        "Martin",
+        "Owen",
+        "Richard",
+        "Karl",
+        "Walter",
+        "Gaston",
+        "Idris",
+        "Tobias",
+    ),
 }
 
 # A slot is free when its session is quiet for this long. Sessions do not report that
@@ -111,10 +96,10 @@ def _names_for_pool() -> Mapping[str, str]:
     slot number.
     """
     return {
-        v["id"]: spoken
+        preset: spoken
         for sex, names in NAMES_BY_SEX.items()
-        for v, spoken in zip(
-            (v for v in _VOICES if v["sex"] == sex), names, strict=False
+        for preset, spoken in zip(
+            (p for p in VOICE_IDS if preset_sex(p) == sex), names, strict=False
         )
     }
 
@@ -297,16 +282,6 @@ def session_name(preset: str, slot: int) -> str:
         names = NAMES_BY_SEX[sex]
         return names[slot % len(names)]
     return str(slot)
-
-
-def preset_sex(preset: str) -> Sex | None:
-    """The sex of a Kokoro preset. Reads the table first, then the id.
-
-    The id is the only handle for a [voices] pin outside the pool.
-    """
-    if is_voice(preset):
-        return voice(preset)["sex"]
-    return SEX_BY_LETTER.get(preset[1:2])
 
 
 async def workspace_root(ctx: Context) -> str | None:

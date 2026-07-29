@@ -33,7 +33,7 @@ def test_the_generated_template_round_trips(tmp_path):
 def test_every_channel_is_documented_in_the_template():
     """A channel with no purpose line would ship an unexplained table."""
     for channel in cfg.CHANNELS:
-        assert f"# {channel['purpose']}\n[{channel['name']}]" in cfg.CONFIG_TEMPLATE
+        assert f"# {channel.purpose}\n[{channel.name}]" in cfg.CONFIG_TEMPLATE
 
 
 def test_the_fallback_channel_is_a_real_channel():

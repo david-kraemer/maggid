@@ -11,11 +11,25 @@ from maggid.config import Config
 # --- names ---------------------------------------------------------------
 
 
-def test_the_voice_table_agrees_with_the_kokoro_ids():
-    """Regression: a hand-edited row gave am_puck a female name."""
-    encoded = {"f": "female", "m": "male"}
+@pytest.mark.parametrize(
+    ("preset", "expected"),
+    [
+        ("af_heart", "female"),
+        ("am_puck", "male"),
+        ("bf_alice", "female"),
+        ("bm_daniel", "male"),
+        ("custom", None),
+        ("", None),
+    ],
+)
+def test_preset_sex_reads_the_kokoro_id(preset, expected):
+    assert identity.preset_sex(preset) == expected
+
+
+def test_every_pooled_voice_has_a_sex():
+    """A preset outside the convention would draw a name from nowhere."""
     for preset in identity.VOICE_IDS:
-        assert identity.voice(preset)["sex"] == encoded[preset[1]]
+        assert identity.preset_sex(preset) is not None
 
 
 def test_every_pooled_voice_has_a_distinct_name():
@@ -26,15 +40,12 @@ def test_every_pooled_voice_has_a_distinct_name():
 
 def test_names_match_voice_sex():
     for preset, spoken in identity.VOICE_NAMES.items():
-        assert spoken in identity.NAMES_BY_SEX[identity.voice(preset)["sex"]]
+        assert spoken in identity.NAMES_BY_SEX[identity.preset_sex(preset)]
 
 
 def test_a_lopsided_pool_loses_a_name_instead_of_failing(monkeypatch):
     """Regression: two exhausted iterators used to raise StopIteration at import."""
-    lopsided = [
-        {"id": f"af_{i}", "sex": "female", "dialect": "american"} for i in range(99)
-    ]
-    monkeypatch.setattr(identity, "_VOICES", lopsided)
+    monkeypatch.setattr(identity, "VOICE_IDS", tuple(f"af_{i}" for i in range(99)))
     assert len(identity._names_for_pool()) == len(identity.NAMES_BY_SEX["female"])
 
 
