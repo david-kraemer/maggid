@@ -17,15 +17,27 @@ def test_missing_file_gives_defaults(tmp_path):
     assert loaded.priorities == dict(cfg.DEFAULT_PRIORITIES)
 
 
-def test_template_matches_default_priorities():
-    """The generated file must agree with the code it documents."""
-    tables = tomllib.loads(cfg.CONFIG_TEMPLATE)
-    written = {
-        name: table["priority"]
-        for name, table in tables.items()
-        if isinstance(table, dict)
-    }
-    assert written == dict(cfg.DEFAULT_PRIORITIES)
+def test_the_generated_template_round_trips(tmp_path):
+    """The emitted file must be TOML this same module can read back.
+
+    CHANNELS is now the only source of the priorities, so agreement is structural.
+    What is still worth asserting is that the emitter produces a parseable file
+    whose tables land where Config.read looks for them.
+    """
+    path = tmp_path / "channels.toml"
+    cfg.Config.write_default(path)
+    assert cfg.Config.read(path).priorities == dict(cfg.DEFAULT_PRIORITIES)
+    assert tomllib.loads(cfg.CONFIG_TEMPLATE)["prefix"] is True
+
+
+def test_every_channel_is_documented_in_the_template():
+    """A channel with no purpose line would ship an unexplained table."""
+    for channel in cfg.CHANNELS:
+        assert f"# {channel['purpose']}\n[{channel['name']}]" in cfg.CONFIG_TEMPLATE
+
+
+def test_the_fallback_channel_is_a_real_channel():
+    assert cfg.FALLBACK_CHANNEL in cfg.DEFAULT_PRIORITIES
 
 
 def test_write_default_config_is_idempotent(tmp_path):

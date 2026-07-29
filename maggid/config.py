@@ -6,7 +6,7 @@ import os
 import pathlib
 import tomllib
 from collections.abc import Mapping
-from typing import Self
+from typing import Self, TypedDict
 
 import soundfile
 
@@ -15,14 +15,26 @@ logger = logging.getLogger(__name__)
 CONFIG_DIR = pathlib.Path.home() / ".config" / "maggid"
 CONFIG_FILE = CONFIG_DIR / "channels.toml"
 
-FALLBACK_CHANNEL = "notify"
 
-DEFAULT_PRIORITIES: Mapping[str, int] = {
-    "permission": 1,
-    "question": 2,
-    "notify": 10,
-    "narrate": 15,
-}
+class Channel(TypedDict):
+    name: str
+    priority: int
+    purpose: str
+
+
+# Priority classes for the shared queue, so urgent speech jumps ahead of narration that
+# already waits. Lower plays first. Both DEFAULT_PRIORITIES and the generated config
+# file come from this table, so adding a channel is adding a row.
+CHANNELS: list[Channel] = [
+    {"name": "permission", "priority": 1, "purpose": "Blocks until you answer."},
+    {"name": "question", "priority": 2, "purpose": "Answer whenever you like."},
+    {"name": "notify", "priority": 10, "purpose": "Stage transitions."},
+    {"name": "narrate", "priority": 15, "purpose": "Reasoning aloud."},
+]
+DEFAULT_PRIORITIES: Mapping[str, int] = {c["name"]: c["priority"] for c in CHANNELS}
+
+# A message with no channel gets this one's priority. A test asserts it is a real row.
+FALLBACK_CHANNEL = "notify"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,8 +131,7 @@ def validate_ref_audio(path: pathlib.Path) -> pathlib.Path:
     return path
 
 
-# The channel tables here must match DEFAULT_PRIORITIES. A test asserts it.
-CONFIG_TEMPLATE = """\
+_CONFIG_PREAMBLE = """\
 # Speak the workspace name before each message, so you know which agent talks.
 # Voice alone separates only four or five workspaces.
 prefix = true
@@ -135,15 +146,15 @@ prefix = true
 # spade = "af_heart"
 
 # Queue priority per channel. Lower plays first.
-[permission]
-priority = 1
-
-[question]
-priority = 2
-
-[notify]
-priority = 10
-
-[narrate]
-priority = 15
 """
+
+# Emitted from CHANNELS rather than written beside it, so the file this hands the user
+# cannot document a priority the code does not use.
+CONFIG_TEMPLATE = (
+    _CONFIG_PREAMBLE
+    + "\n"
+    + "\n".join(
+        f"# {c['purpose']}\n[{c['name']}]\npriority = {c['priority']}\n"
+        for c in CHANNELS
+    )
+)
