@@ -219,6 +219,7 @@ N × Claude Code  ──http──>  one daemon  ──>  Chatterbox Turbo  ─�
 | ------------- | ---------------------------------------------------- |
 | `config.py`   | The TOML file: reference voice, channel priorities   |
 | `identity.py` | Workspace roots, voice assignment, session slots     |
+| `device.py`   | Which output device is current, and telling PortAudio |
 | `synth.py`    | Model loading, conditionals, inference               |
 | `playback.py` | Priority queue, audio device, resampling             |
 | `server.py`   | MCP tools, lifecycle, command line                   |
@@ -232,6 +233,66 @@ N × Claude Code  ──http──>  one daemon  ──>  Chatterbox Turbo  ─�
   notification. Removing it also made `interrupt` near-instant, about 50 ms.
 - **Rate at playback.** Chatterbox ignores a speed argument, so the server
   resamples before the device write instead of running inference again.
+- **The stream follows the output device.** See below — holding one stream open
+  is what made this need saying at all.
+
+### Following the output device
+
+Connect a headset to a running daemon and speech has to move to it. Under
+`afplay` this was free: a new process picked up the current default output every
+time. One stream held open for the life of the daemon gives that up, because
+PortAudio decides two things when it initializes and never revisits either —
+what hardware exists, and which of it is "the default output". A stream opened at
+login therefore keeps writing to the speakers, and the headset is not even in the
+device list to switch to.
+
+Re-initializing PortAudio refreshes both. It cannot be what *detects* the change,
+though, because it leaves every open stream a dangling pointer. So the two jobs
+go to the two APIs that can do them:
+
+- **CoreAudio says whether the output moved.** One HAL property read for the
+  default device's id, about 15 µs, and harmless to an open stream. Cheap enough
+  to ask before every utterance, which is the right cadence: between utterances
+  there is no playback for a reopen to interrupt.
+- **PortAudio gets re-initialized, then asked for its own default.** It reads the
+  same CoreAudio property, so after the re-scan the two agree by construction and
+  there is no device name to match up.
+
+The reopen — abort, close, re-scan, open — costs 130 to 190 ms depending on the
+device, paid only when it actually changed. The id is a token compared for
+equality and nothing else. PortAudio names the device for the log line, which is
+the same string CoreAudio would give and a fortieth of the cost.
+
+**The id is a token and not a name because names are not unique.** One soundcore
+headset registers twice under a single name, and both entries are outputs
+PortAudio will happily open. Matching a CoreAudio name against PortAudio's device
+list would be a coin flip on exactly the hardware this feature exists for.
+
+A short write with no interrupt pending means the device went away mid-utterance:
+the headset walked out of range. That reopens once and finishes the rest of the
+utterance on whatever is default now, rather than dropping it.
+
+`device.py` calls `sounddevice._terminate` and `_initialize`, which are private.
+There is no public way to make PortAudio re-read the hardware.
+
+**Why not drop the persistent stream instead?** Opening a fresh stream per
+utterance would delete this whole module: PortAudio re-reads its default every
+time, so audio lands on the current device with no probe, no token, and no
+CoreAudio. Measured, it costs 247 ms an utterance on Bluetooth against 42 ms for
+a write to a stream already open. That is more than the 190 ms of synthesis in
+front of it, on every notification, to save fifty lines. `afplay`'s 1.0 s was
+process and framework startup; a fresh in-process stream is far cheaper than that
+and still not cheap. The held-open stream earns its complexity, and it earns it on
+the Bluetooth headset rather than in the general case.
+
+**Why not a CoreAudio property listener?** Push instead of poll would replace a
+15 µs read with a flag, and cost a C callback into Python, a run loop, and
+mutable state written from a CoreAudio thread. There is no latency to win: the
+poll is already free at the only cadence that matters.
+
+**Why not reopen speculatively, while idle?** It would hide the 190 ms from the
+first utterance after a switch. It also needs a timer and a background task to
+own it, which is real structure for a saving David sees a few times a day.
 
 ## Development
 
@@ -242,7 +303,14 @@ uv run --group dev ruff format .
 ```
 
 The tests cover config loading, voice and slot assignment, spoken labels, queue
-ordering, and resampling. None of them load the model or open the audio device.
+ordering, resampling, and output-device selection. None of them load the model.
+
+`test_device.py` is the one file that touches real hardware, and has to: every
+claim the device-following design rests on is a claim about what CoreAudio and
+PortAudio actually do, and a mock would only restate the assumption. It opens a
+stream, times the HAL probe, and asserts that a re-scan invalidates an open
+stream. Those tests skip off macOS.
+
 
 ## Troubleshooting
 
